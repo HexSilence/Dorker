@@ -1,0 +1,56 @@
+# API secrets intentionally do not belong in this file. Use environment variables.
+database:
+  # Generated configs use an OS-appropriate path from os.UserConfigDir.
+  path: dorker.db
+scheduler:
+  workers: 5
+  saturation:
+    enabled: true
+    consecutive_zero_yield_pages: 2
+  recovery:
+    wait: false
+    max_wait: 2m
+retry:
+  max_attempts: 4
+  base_delay: 2s
+  max_delay: 2m
+  jitter: true
+http:
+  request_timeout: 20s
+  connect_timeout: 5s
+  max_body_bytes: 4194304
+validation:
+  mode: conservative
+output:
+  collapse: none
+  directory: ~/dorker-output
+ui:
+  banner: true
+  color: auto
+providers:
+  searxng:
+    enabled: true
+    strategy: balanced
+    # engines/categories/language/safesearch/time_range are optional.
+    instances:
+      - name: local
+        url: http://127.0.0.1:8080
+        requests_per_second: 1
+        burst: 1
+        # token_env: SEARXNG_TOKEN
+  google-api:
+    enabled: true
+    requests_per_second: 1
+    burst: 1
+  brave:
+    enabled: true
+    requests_per_second: 1
+    burst: 2
+  serpapi:
+    enabled: false
+    requests_per_second: 1
+    burst: 1
+  mock:
+    enabled: false
+    requests_per_second: 100
+    burst: 10

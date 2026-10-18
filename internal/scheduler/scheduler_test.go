@@ -1,0 +1,121 @@
+package scheduler
+
+import (
+	"context"
+	"database/sql"
+	"io"
+	"log/slog"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/HexSilence/dorker/internal/collector"
+	"github.com/HexSilence/dorker/internal/model"
+	"github.com/HexSilence/dorker/internal/normalize"
+	"github.com/HexSilence/dorker/internal/provider/mock"
+	rl "github.com/HexSilence/dorker/internal/ratelimit"
+	"github.com/HexSilence/dorker/internal/store"
+	_ "modernc.org/sqlite"
+)
+
+func TestCancellationFailureIsolationAndResume(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err = st.CreateJob(ctx, "job", "{}"); err != nil {
+		t.Fatal(err)
+	}
+	vs := []model.QueryVariant{{Original: "q", Variant: "q"}}
+	if err = st.AddVariants(ctx, "job", vs); err != nil {
+		t.Fatal(err)
+	}
+	cctx, cancel := context.WithCancel(ctx)
+	col := &collector.Collector{Store: st, JobID: "job", Normalizer: normalize.New(normalize.Options{})}
+	col.OnUnique = func(string) {
+		if col.Unique.Load() >= 25 {
+			cancel()
+		}
+	}
+	a := mock.New(mock.Config{Name: "limited", Total: 100, PageSize: 10, RateLimitPage: 2, TemporaryPage: -1, QuotaPage: -1, Delay: time.Millisecond, BaseURL: "https://results.test"})
+	b := mock.New(mock.Config{Name: "healthy", Total: 100, PageSize: 10, RateLimitPage: -1, TemporaryPage: -1, QuotaPage: -1, Delay: time.Millisecond, BaseURL: "https://results.test"})
+	opts := Options{Workers: 2, MaxResults: 100, MaxResultsPerQuery: 100, PageSize: 10, WaitForRecovery: true, MaxRecoveryWait: time.Second, Retry: rl.RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: 20 * time.Millisecond}}
+	s := New(st, col, slog.New(slog.NewTextHandler(io.Discard, nil)), opts)
+	if err = s.Run(cctx, "job", vs, []Runtime{NewRuntime(a, 1000, 10), NewRuntime(b, 1000, 10)}, nil); err == nil {
+		t.Fatal("expected cancellation")
+	}
+	progress, err := st.LoadProgress(ctx, "job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	completedPage := false
+	for _, p := range progress {
+		if p.Page > 0 {
+			completedPage = true
+		}
+	}
+	if !completedPage {
+		t.Fatal("no checkpoint persisted before cancellation")
+	}
+	col2 := &collector.Collector{Store: st, JobID: "job", Normalizer: normalize.New(normalize.Options{})}
+	s2 := New(st, col2, slog.New(slog.NewTextHandler(io.Discard, nil)), opts)
+	if err = s2.Run(ctx, "job", vs, []Runtime{NewRuntime(a, 1000, 10), NewRuntime(b, 1000, 10)}, progress); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := st.Stats(ctx, "job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Unique != 100 {
+		t.Fatalf("unique=%d raw=%d", stats.Unique, stats.Raw)
+	}
+	progress, err = st.LoadProgress(ctx, "job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range progress {
+		if p.State != "COMPLETE" {
+			t.Fatalf("%s state=%s", p.Provider, p.State)
+		}
+	}
+}
+
+func TestResultFailureDoesNotAdvanceCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "test.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err = st.CreateJob(ctx, "job", "{}"); err != nil {
+		t.Fatal(err)
+	}
+	vs := []model.QueryVariant{{Original: "q", Variant: "q"}}
+	if err = st.AddVariants(ctx, "job", vs); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err = db.Exec(`CREATE TRIGGER fail_results BEFORE INSERT ON discoveries BEGIN SELECT RAISE(ABORT, 'injected'); END;`); err != nil {
+		t.Fatal(err)
+	}
+	col := &collector.Collector{Store: st, JobID: "job", Normalizer: normalize.New(normalize.Options{})}
+	p := mock.New(mock.Config{Name: "real-shaped", Total: 30, PageSize: 10, RateLimitPage: -1, TemporaryPage: -1, QuotaPage: -1, BaseURL: "https://example.com"})
+	s := New(st, col, slog.New(slog.NewTextHandler(io.Discard, nil)), Options{Workers: 1, MaxPages: 3, PageSize: 10, Retry: rl.RetryPolicy{MaxAttempts: 1}})
+	if err = s.Run(ctx, "job", vs, []Runtime{NewRuntime(p, 1000, 10)}, nil); err == nil {
+		t.Fatal("expected persistence failure")
+	}
+	progress, err := st.LoadProgress(ctx, "job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(progress) != 1 || progress[0].Page != 0 {
+		t.Fatalf("%+v", progress)
+	}
+}
