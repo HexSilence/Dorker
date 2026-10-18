@@ -87,7 +87,7 @@ func Run(args []string, streams IO) int {
 		return 0
 	}
 	if args[0] == "--version" {
-		fmt.Fprintf(streams.Out, "%s %s (commit %s, built %s)\n", buildinfo.Name, buildinfo.Version, buildinfo.Commit, buildinfo.Date)
+		fmt.Fprintln(streams.Out, buildinfo.String())
 		return 0
 	}
 	if args[0] == "--resume" {
@@ -137,7 +137,7 @@ func Run(args []string, streams IO) int {
 	case "query":
 		return runQuery(args, streams)
 	case "version":
-		fmt.Fprintf(streams.Out, "%s %s (commit %s, built %s)\n", buildinfo.Name, buildinfo.Version, buildinfo.Commit, buildinfo.Date)
+		fmt.Fprintln(streams.Out, buildinfo.String())
 		return 0
 	case "help", "--help", "-h":
 		ui.Help(streams.Out)
