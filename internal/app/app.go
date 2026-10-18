@@ -255,7 +255,7 @@ func runGHDBInteractive(entries []ghdb.Entry, r *ui.Renderer, ioo IO) int {
 	base, _ := ghdb.Expand(selected, "")
 	fmt.Fprintln(ioo.Out)
 	r.GHDBShow(toUIEntry(selected, base), false)
-	fmt.Fprint(ioo.Out, "\nTarget domain (optional): ")
+	fmt.Fprint(ioo.Out, "\nTarget domain (optional)\n  Leave empty to search globally.\n\n> ")
 	domain, err := readPromptLine(reader)
 	if err == io.EOF {
 		fmt.Fprintln(ioo.Out, "\nCancelled.")

@@ -181,6 +181,7 @@ Interactive searches save non-empty results under `~/dorker-output` by default:
 example.com/directory-listings/results.txt
 ghdb/directory-listings/results.txt
 search/site-example.com/results.txt
+search/site-ye/results.txt
 ```
 
 Repeated runs use `results-2.txt`, `results-3.txt`, and so on. Existing files are not overwritten. `--format jsonl` and `--format csv` select matching extensions. `--collapse none|host|domain` controls the saved selection while SQLite retains canonical data.
@@ -193,6 +194,8 @@ dorker search -q 'site:example.com' | httpx
 ```
 
 Zero-result automatic searches do not create empty files. Change the root with `output.directory` or `--output-dir`.
+
+In interactive GHDB, leave the optional target domain empty to search globally.
 
 ## Providers
 

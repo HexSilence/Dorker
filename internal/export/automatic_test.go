@@ -9,8 +9,17 @@ import (
 )
 
 func TestSlugPortableAndSafe(t *testing.T) {
-	tests := map[string]string{"Directory Listings": "directory-listings", "PDF Documents": "pdf-documents", "Example.COM": "example.com", "../../NUL\\x\x00": "nul-x"}
-	tests["site:example.com"] = "site-example.com"
+	tests := map[string]string{
+		"Directory Listings":         "directory-listings",
+		"PDF Documents":              "pdf-documents",
+		"Example.COM":                "example.com",
+		"../../NUL\\x\x00":           "nul-x",
+		"site:example.com":           "site-example.com",
+		"site:.ye":                   "site-ye",
+		"ext:pdf":                    "ext-pdf",
+		"site:example.com ext:pdf":   "site-example.com-ext-pdf",
+		"...site:::...ye---ext::pdf": "site-ye-ext-pdf",
+	}
 	for in, want := range tests {
 		if got := Slug(in); got != want {
 			t.Errorf("Slug(%q)=%q want %q", in, got, want)
@@ -21,6 +30,9 @@ func TestSlugPortableAndSafe(t *testing.T) {
 		if strings.ContainsAny(got, `/\\`) || got == ".." || strings.ContainsRune(got, 0) {
 			t.Fatalf("unsafe slug %q", got)
 		}
+	}
+	if got := Slug(strings.Repeat("long-value-", 20)); len(got) > maxSlugLength || strings.ContainsAny(got[len(got)-1:], ".-") {
+		t.Fatalf("unbounded or punctuated slug %q", got)
 	}
 	_ = runtime.GOOS // portability is enforced independent of host OS.
 }

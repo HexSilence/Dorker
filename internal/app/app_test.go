@@ -114,7 +114,8 @@ func TestInteractiveBannerControlsAndQuiet(t *testing.T) {
 func TestRedirectedStreamingStdoutIsCleanAndQueryQUnchanged(t *testing.T) {
 	var out, errout bytes.Buffer
 	dir := t.TempDir()
-	if code := Run([]string{"search", "-q", "example", "--provider", "mock", "--max-results", "2", "--max-pages", "1", "--stream", "--db", filepath.Join(dir, "x.db"), "--config", filepath.Join(dir, "missing.yaml")}, IO{In: strings.NewReader(""), Out: &out, Err: &errout}); code != 0 {
+	autoDir := filepath.Join(dir, "out")
+	if code := Run([]string{"search", "-q", "example", "--provider", "mock", "--max-results", "2", "--max-pages", "1", "--stream", "--output-dir", autoDir, "--db", filepath.Join(dir, "x.db"), "--config", filepath.Join(dir, "missing.yaml")}, IO{In: strings.NewReader(""), Out: &out, Err: &errout}); code != 0 {
 		t.Fatalf("code=%d stderr=%s", code, errout.String())
 	}
 	if strings.Contains(out.String(), "DORKER") || strings.Contains(out.String(), "\x1b[") {
@@ -125,6 +126,9 @@ func TestRedirectedStreamingStdoutIsCleanAndQueryQUnchanged(t *testing.T) {
 			t.Fatalf("unclean stream line %q", line)
 		}
 	}
+	if _, err := os.Stat(autoDir); !os.IsNotExist(err) {
+		t.Fatalf("pipeline created automatic output: %v", err)
+	}
 }
 
 func TestRedirectedStdoutAutomaticallyExportsCleanResults(t *testing.T) {
@@ -132,17 +136,21 @@ func TestRedirectedStdoutAutomaticallyExportsCleanResults(t *testing.T) {
 		t.Run(format, func(t *testing.T) {
 			var out, errout bytes.Buffer
 			dir := t.TempDir()
-			args := []string{"search", "-q", "example", "--provider", "mock", "--max-results", "2", "--max-pages", "1", "--format", format, "--db", filepath.Join(dir, "x.db"), "--config", filepath.Join(dir, "missing.yaml")}
+			autoDir := filepath.Join(dir, "out")
+			args := []string{"search", "-q", "example", "--provider", "mock", "--max-results", "2", "--max-pages", "1", "--format", format, "--output-dir", autoDir, "--db", filepath.Join(dir, "x.db"), "--config", filepath.Join(dir, "missing.yaml")}
 			if code := Run(args, IO{In: strings.NewReader(""), Out: &out, Err: &errout}); code != 0 {
 				t.Fatalf("code=%d stderr=%s", code, errout.String())
 			}
 			if out.Len() == 0 {
 				t.Fatal("redirected stdout is empty")
 			}
-			for _, forbidden := range []string{"D O R K E R", "[STATS]", "INFO", "\x1b["} {
+			for _, forbidden := range []string{"D O R K E R", "DORKER / SEARCH", "Searching...", "Search complete", "Results", "Provider", "Saved", "INFO", "\x1b["} {
 				if strings.Contains(out.String(), forbidden) {
 					t.Fatalf("stdout contains %q: %s", forbidden, out.String())
 				}
+			}
+			if _, err := os.Stat(autoDir); !os.IsNotExist(err) {
+				t.Fatalf("redirect created automatic output: %v", err)
 			}
 			switch format {
 			case "txt":
@@ -199,7 +207,8 @@ func TestExplicitOutputTakesPrecedenceOverAutoStdout(t *testing.T) {
 	var out, errout bytes.Buffer
 	dir := t.TempDir()
 	destination := filepath.Join(dir, "results.txt")
-	args := []string{"search", "-q", "example", "--provider", "mock", "--max-results", "1", "--max-pages", "1", "-o", destination, "--db", filepath.Join(dir, "x.db"), "--config", filepath.Join(dir, "missing.yaml")}
+	autoDir := filepath.Join(dir, "out")
+	args := []string{"search", "-q", "example", "--provider", "mock", "--max-results", "1", "--max-pages", "1", "-o", destination, "--output-dir", autoDir, "--db", filepath.Join(dir, "x.db"), "--config", filepath.Join(dir, "missing.yaml")}
 	if code := Run(args, IO{In: strings.NewReader(""), Out: &out, Err: &errout}); code != 0 {
 		t.Fatalf("code=%d stderr=%s", code, errout.String())
 	}
@@ -209,6 +218,9 @@ func TestExplicitOutputTakesPrecedenceOverAutoStdout(t *testing.T) {
 	b, err := os.ReadFile(destination)
 	if err != nil || len(b) == 0 {
 		t.Fatalf("output=%q err=%v", b, err)
+	}
+	if _, err := os.Stat(autoDir); !os.IsNotExist(err) {
+		t.Fatalf("explicit output also created automatic output: %v", err)
 	}
 }
 
@@ -240,7 +252,7 @@ func TestAutomaticOutputFormatsRepeatedAndEmpty(t *testing.T) {
 		t.Run(format, func(t *testing.T) {
 			dir := t.TempDir()
 			args := []string{"search", "-q", "site:example.com", "--provider", "mock", "--validation", "off", "--max-results", "2", "--max-pages", "1", "--format", format, "--output-dir", filepath.Join(dir, "out"), "--db", filepath.Join(dir, "x.db"), "--config", filepath.Join(dir, "missing.yaml")}
-			for run := 1; run <= 2; run++ {
+			for run := 1; run <= 3; run++ {
 				var out, errout bytes.Buffer
 				if code := Run(args, IO{In: strings.NewReader(""), Out: &out, Err: &errout, Interactive: &interactive}); code != 0 {
 					t.Fatalf("run %d code=%d stderr=%s", run, code, errout.String())
@@ -248,6 +260,8 @@ func TestAutomaticOutputFormatsRepeatedAndEmpty(t *testing.T) {
 				name := "results." + format
 				if run == 2 {
 					name = "results-2." + format
+				} else if run == 3 {
+					name = "results-3." + format
 				}
 				if _, err := os.Stat(filepath.Join(dir, "out", "search", "site-example.com", name)); err != nil {
 					t.Fatal(err)
@@ -297,6 +311,9 @@ func TestInteractiveGHDBAutomaticOutputDomainAndGlobal(t *testing.T) {
 			path = strings.TrimSuffix(path, ".csv") + ".txt"
 			if _, err := os.Stat(path); err != nil {
 				t.Fatalf("%s: %v", path, err)
+			}
+			if !strings.Contains(out.String(), "Target domain (optional)\n  Leave empty to search globally.\n\n> ") {
+				t.Fatalf("missing global-search guidance: %q", out.String())
 			}
 		})
 	}

@@ -7,20 +7,29 @@ import (
 	"strings"
 )
 
+const maxSlugLength = 80
+
 // Slug returns a readable path component containing only portable ASCII.
 func Slug(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	var b strings.Builder
-	dash := false
-	for _, r := range value {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' {
-			b.WriteRune(r)
-			dash = false
-		} else {
-			if b.Len() > 0 && !dash {
+	separator := false
+	for i := 0; i < len(value) && b.Len() < maxSlugLength; i++ {
+		c := value[i]
+		alphanumeric := (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+		// Dots are useful within hostnames, but leading, trailing, and repeated
+		// dots are punctuation rather than meaningful path text.
+		dot := c == '.' && !separator && b.Len() > 0 && i+1 < len(value) && isASCIIAlphanumeric(value[i+1])
+		if alphanumeric || dot {
+			if separator && b.Len() > 0 && b.Len() < maxSlugLength {
 				b.WriteByte('-')
-				dash = true
 			}
+			if b.Len() < maxSlugLength {
+				b.WriteByte(c)
+			}
+			separator = false
+		} else if b.Len() > 0 {
+			separator = true
 		}
 	}
 	s := strings.Trim(b.String(), "-.")
@@ -34,6 +43,10 @@ func Slug(value string) string {
 		return "search-" + s
 	}
 	return s
+}
+
+func isASCIIAlphanumeric(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
 }
 
 // AutomaticPath selects results.ext, results-2.ext, ... without overwriting.
