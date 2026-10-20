@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -50,8 +51,15 @@ func TestBootstrapCreatesSecureConfigAndNeverOverwrites(t *testing.T) {
 	if err != nil || !strings.Contains(string(b), "database:") {
 		t.Fatalf("config=%q err=%v", b, err)
 	}
-	if info, err := os.Stat(path); err != nil || info.Mode().Perm()&0077 != 0 {
-		t.Fatalf("mode=%v err=%v", info.Mode(), err)
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
+		t.Fatalf("mode=%v want=0600", info.Mode().Perm())
+	}
+	if _, err = Load(path); err != nil {
+		t.Fatalf("load bootstrapped config: %v", err)
 	}
 	if err = os.WriteFile(path, []byte("preserve\n"), 0600); err != nil {
 		t.Fatal(err)
