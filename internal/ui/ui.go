@@ -90,15 +90,15 @@ func (r *Renderer) Banner() {
 		return
 	}
 	const width = 46
-	lines := []string{"", "D O R K E R", "Advanced Search Intelligence", "& Reconnaissance Engine", "", "Developed & Engineered by", "Silence && Fro7h", "", "Built for Precision • Driven by Research", "© 2026 Dorker", "All Rights Reserved"}
+	lines := []string{"", "D O R K E R", "Advanced Search Intelligence", "& Reconnaissance Engine", "", "Developed & Engineered by", "Silence", "", "Built for Precision • Driven by Research", "© 2026 HexSilence", "Apache License 2.0"}
 	fmt.Fprintln(r.w, r.Border("┌"+strings.Repeat("─", width)+"┐"))
 	for _, line := range lines {
 		rendered := center(line, width)
 		if line == "D O R K E R" {
 			rendered = r.Brand(rendered)
-		} else if line == "Silence && Fro7h" {
+		} else if line == "Silence" {
 			rendered = r.Command(rendered)
-		} else if line == "Developed & Engineered by" || line == "Built for Precision • Driven by Research" || line == "© 2026 Dorker" || line == "All Rights Reserved" {
+		} else if line == "Developed & Engineered by" || line == "Built for Precision • Driven by Research" || line == "© 2026 HexSilence" || line == "Apache License 2.0" {
 			rendered = r.Muted(rendered)
 		}
 		fmt.Fprintf(r.w, "%s%s%s\n", r.Border("│"), rendered, r.Border("│"))
@@ -124,7 +124,7 @@ func (r *Renderer) Startup() {
 		fmt.Fprintln(r.w, "  "+r.commandLine(x))
 	}
 	fmt.Fprintln(r.w, "\n"+r.Heading("Commands"))
-	r.rows([]Row{{"search", "Find and collect URLs"}, {"ghdb", "Browse ready-made dorks"}, {"setup", "Create a working configuration"}, {"doctor", "Inspect the local environment"}, {"providers", "Check provider health"}, {"query", "Explain or validate a query"}, {"jobs", "Browse saved jobs"}, {"resume", "Continue a job"}})
+	r.rows([]Row{{"search", "Find and collect URLs"}, {"discover", "Recursively expand in-scope hosts"}, {"ghdb", "Browse ready-made dorks"}, {"setup", "Create a working configuration"}, {"doctor", "Inspect the local environment"}, {"providers", "Check provider health"}, {"query", "Explain or validate a query"}, {"jobs", "Browse saved jobs"}, {"resume", "Continue a job"}})
 	fmt.Fprintln(r.w, "\n"+r.Heading("More"))
 	fmt.Fprintln(r.w, "  "+r.Command("dorker --help"))
 }
@@ -164,11 +164,11 @@ removes duplicates, and keeps track of where each URL came from.
 	fmt.Fprintln(r.w, r.Heading("USAGE"))
 	fmt.Fprintln(r.w, "  "+r.commandLine("dorker <command> [options]"))
 	fmt.Fprintln(r.w, "\n"+r.Heading("COMMANDS"))
-	r.rows([]Row{{"search", "Find and collect URLs"}, {"ghdb", "Browse ready-made dorks"}, {"setup", "Create a working configuration"}, {"doctor", "Inspect the local environment"}, {"providers", "Check provider health"}, {"query", "Explain or validate queries"}, {"jobs", "Browse saved jobs"}, {"resume", "Continue a job"}})
+	r.rows([]Row{{"search", "Find and collect URLs"}, {"discover", "Recursively expand in-scope hosts"}, {"ghdb", "Browse ready-made dorks"}, {"setup", "Create a working configuration"}, {"doctor", "Inspect the local environment"}, {"providers", "Check provider health"}, {"query", "Explain or validate queries"}, {"jobs", "Browse saved jobs"}, {"resume", "Continue a job"}})
 	fmt.Fprintln(r.w, "\n"+r.Heading("OTHER COMMANDS"))
 	r.rows([]Row{{"stats", "Show job statistics"}, {"export", "Export a saved job"}, {"config", "Show or check configuration"}, {"version", "Show version info"}})
 	fmt.Fprintln(r.w, "\n"+r.Heading("EXAMPLES"))
-	for _, x := range []string{"dorker search -q 'site:example.com'", "dorker ghdb", "dorker search -q 'site:example.com ext:pdf' > results.txt", "dorker providers test searxng"} {
+	for _, x := range []string{"dorker search -q 'site:example.com'", "dorker discover -q 'site:example.com'", "dorker ghdb", "dorker search -q 'site:example.com ext:pdf' > results.txt", "dorker providers test searxng"} {
 		fmt.Fprintln(r.w, "  "+r.commandLine(x))
 	}
 	fmt.Fprintln(r.w, "\nRun "+r.Command("dorker <command> --help")+" for command-specific options.")
@@ -251,6 +251,43 @@ Examples:
 func CommandHelp(w io.Writer, command, _ string) bool {
 	var text string
 	switch command {
+	case "discover":
+		text = `Recursively search newly discovered in-scope hosts.
+
+Usage:
+  dorker discover -q 'site:example.com' [options]
+
+Limits:
+  --max-depth N              Maximum recursive expansion depth.
+  --max-hosts N              Maximum unique hosts.
+  --max-queries N            Maximum provider queries.
+  --max-results N            Maximum unique URLs.
+  --max-results-per-query N  Maximum URLs per expansion query.
+  --max-pages N              Maximum pages per provider/query.
+  --max-duration DURATION    Maximum elapsed time.
+
+Saturation:
+  --saturation-threshold RATIO
+  --saturation-consecutive-depths N
+
+Output:
+  --hosts-only               Emit only hosts when redirected or piped.
+  --roots-only               Emit only registrable domains.
+  -o, --output DIRECTORY     Write discovery artifacts to a directory.
+  --output-dir DIRECTORY     Automatic output root.
+
+Other:
+  --provider NAME            Provider to use; repeatable.
+  --page-size N              Results requested per provider page.
+  --workers N                Number of bounded workers.
+  --validation MODE          off, conservative, or strict.
+  --log-level LEVEL          debug, info, warn, error, or off.
+  --quiet                    Hide progress and informational messages.
+  --no-banner                Hide the interactive banner.
+  --dry-run                  Show scope, limits, and strategy only.
+  --db FILE                  Use a different SQLite database.
+  --config FILE              Use a different configuration file.
+`
 	case "providers":
 		text = `Check configured search providers.
 
@@ -329,7 +366,29 @@ Usage:
 	case "doctor":
 		text = "Inspect configuration, paths, providers, and optional runtimes.\n\nUsage:\n  dorker doctor [--config FILE]\n"
 	case "setup":
-		text = "Create a starter configuration and show provider setup choices.\n\nUsage:\n  dorker setup [--config FILE]\n  dorker setup searxng [--yes]\n"
+		text = "Create a starter configuration and show provider setup choices.\n\nUsage:\n  dorker setup [--config FILE]\n  dorker setup searxng [--config FILE] [--yes]\n"
+	case "setup searxng":
+		text = `Preview or create a private local SearXNG container.
+
+Usage:
+  dorker setup searxng [--config FILE] [--yes]
+
+Options:
+  --config FILE   Use a different configuration file.
+  --yes           Confirm container creation or startup.
+
+Without --yes, Dorker only previews the action. Podman is preferred;
+Docker is used when Podman is unavailable.
+`
+	case "resume":
+		text = `Continue a saved search or discovery job.
+
+Usage:
+  dorker resume [JOB-ID] [options]
+
+With no job ID, Dorker continues the latest resumable search job.
+Discovery jobs restore their saved frontier, limits, and owned output directory.
+`
 	case "version":
 		text = `Show version info.
 
@@ -596,6 +655,7 @@ type Constraint struct{ Name, Value string }
 type QueryExplanation struct {
 	Query, ProviderText string
 	Local               []Constraint
+	Scope               []string
 }
 
 func (r *Renderer) QueryExplain(x QueryExplanation) {
@@ -605,6 +665,12 @@ func (r *Renderer) QueryExplain(x QueryExplanation) {
 	}
 	for _, c := range x.Local {
 		fmt.Fprintf(r.w, "  %-12s %s\n", c.Name, c.Value)
+	}
+	if len(x.Scope) > 0 {
+		fmt.Fprintln(r.w, "\n"+r.heading("Scope behavior")+"\n")
+		for _, line := range x.Scope {
+			fmt.Fprintln(r.w, "  "+line)
+		}
 	}
 	fmt.Fprintln(r.w, "\n"+r.heading("Left to provider")+"\n")
 	if strings.TrimSpace(x.ProviderText) == "" {

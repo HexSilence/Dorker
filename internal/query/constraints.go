@@ -2,12 +2,13 @@ package query
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"path"
 	"sort"
 	"strings"
 
-	"golang.org/x/net/idna"
+	"github.com/HexSilence/dorker/internal/normalize"
 )
 
 type ValidationMode string
@@ -48,6 +49,8 @@ const (
 	ReasonInURLMatch        ValidationReason = "inurl_match"
 	ReasonInURLMismatch     ValidationReason = "inurl_mismatch"
 	ReasonExcludedInURL     ValidationReason = "excluded_inurl"
+	ReasonMalformedURL      ValidationReason = "malformed_url"
+	ReasonMissingHostname   ValidationReason = "missing_hostname"
 )
 
 type SiteConstraint struct {
@@ -59,7 +62,7 @@ func (s SiteConstraint) String() string {
 	if s.Wildcard {
 		return "*." + s.Value
 	}
-	if strings.Count(s.Value, ".") == 0 {
+	if strings.Count(s.Value, ".") == 0 && !strings.Contains(s.Value, ":") {
 		return "." + s.Value
 	}
 	return s.Value
@@ -86,7 +89,7 @@ type ValidationResult struct {
 func ExtractConstraints(raw string) (QueryConstraints, error) {
 	var c QueryConstraints
 	for _, tok := range tokens(raw) {
-		if tok.quoted {
+		if tok.quoted && strings.HasPrefix(tok.text, `"`) {
 			c.ProviderOnly = append(c.ProviderOnly, tok.text)
 			continue
 		}
@@ -101,7 +104,13 @@ func ExtractConstraints(raw string) (QueryConstraints, error) {
 			continue
 		}
 		op, val := strings.ToLower(body[:i]), strings.TrimSpace(body[i+1:])
-		if strings.Contains(val, `"`) {
+		if strings.HasPrefix(val, `"`) && strings.HasSuffix(val, `"`) && len(val) >= 2 {
+			val = strings.TrimSpace(val[1 : len(val)-1])
+		} else if strings.Contains(val, `"`) {
+			c.ProviderOnly = append(c.ProviderOnly, tok.text)
+			continue
+		}
+		if strings.ContainsAny(val, " \t\r\n") {
 			c.ProviderOnly = append(c.ProviderOnly, tok.text)
 			continue
 		}
@@ -184,9 +193,12 @@ func normalizeSite(v string) (SiteConstraint, error) {
 	} else {
 		v = strings.TrimPrefix(v, ".")
 	}
-	a, err := idna.Lookup.ToASCII(v)
-	if err != nil || a == "" || strings.ContainsAny(a, "/?#:@") {
+	a, err := normalize.Hostname(v)
+	if err != nil || strings.ContainsAny(a, "/?#@") {
 		return SiteConstraint{}, fmt.Errorf("invalid site constraint %q", v)
+	}
+	if wild && net.ParseIP(a) != nil {
+		return SiteConstraint{}, fmt.Errorf("wildcard IP site constraint is invalid")
 	}
 	return SiteConstraint{Value: a, Wildcard: wild}, nil
 }
@@ -208,19 +220,22 @@ func appendUniqueSite(a []SiteConstraint, v SiteConstraint) []SiteConstraint {
 }
 
 func (c QueryConstraints) Evaluate(normalized string, mode ValidationMode) ValidationResult {
-	if mode == ValidationOff || !c.HasEnforceable {
+	if !c.HasEnforceable {
 		return ValidationResult{Decision: "ACCEPT", State: Match}
 	}
 	u, err := url.Parse(normalized)
 	if err != nil {
-		return ValidationResult{Decision: "REJECT", State: Mismatch}
+		return rejected(ReasonMalformedURL)
 	}
 	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	if (len(c.Sites) > 0 || len(c.ExcludedSites) > 0) && host == "" {
+		return rejected(ReasonMissingHostname)
+	}
 	var ev []Evaluation
 	if len(c.Sites) > 0 {
 		ok := false
 		for _, s := range c.Sites {
-			if siteMatch(host, s) {
+			if SiteMatch(host, s) {
 				ok = true
 				break
 			}
@@ -232,9 +247,15 @@ func (c QueryConstraints) Evaluate(normalized string, mode ValidationMode) Valid
 		}
 	}
 	for _, s := range c.ExcludedSites {
-		if siteMatch(host, s) {
+		if SiteMatch(host, s) {
 			ev = append(ev, Evaluation{"-site:" + s.String(), Mismatch, ReasonExcludedSite})
 		}
+	}
+	// Site constraints define scope, rather than merely a provider hint. They
+	// remain fail-closed even when optional local validation is disabled. This
+	// prevents an upstream provider from broadening the authoritative result set.
+	if mode == ValidationOff {
+		return finish(ev, ValidationConservative)
 	}
 	ext := strings.ToLower(strings.TrimPrefix(path.Ext(u.Path), "."))
 	if len(c.Extensions) > 0 {
@@ -282,6 +303,15 @@ func (c QueryConstraints) Evaluate(normalized string, mode ValidationMode) Valid
 			ev = append(ev, Evaluation{"-inurl:" + v, Mismatch, ReasonExcludedInURL})
 		}
 	}
+	return finish(ev, mode)
+}
+
+func rejected(reason ValidationReason) ValidationResult {
+	e := Evaluation{Constraint: "url", State: Mismatch, Reason: reason}
+	return ValidationResult{Decision: "REJECT", State: Mismatch, Reasons: []ValidationReason{reason}, Evaluations: []Evaluation{e}}
+}
+
+func finish(ev []Evaluation, mode ValidationMode) ValidationResult {
 	state := Match
 	for _, e := range ev {
 		if e.State == Mismatch {
@@ -302,7 +332,11 @@ func (c QueryConstraints) Evaluate(normalized string, mode ValidationMode) Valid
 	}
 	return ValidationResult{Decision: decision, State: state, Reasons: reasons, Evaluations: ev}
 }
-func siteMatch(host string, s SiteConstraint) bool {
+func SiteMatch(host string, s SiteConstraint) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if net.ParseIP(s.Value) != nil {
+		return host == s.Value
+	}
 	if s.Wildcard {
 		return host != s.Value && strings.HasSuffix(host, "."+s.Value)
 	}

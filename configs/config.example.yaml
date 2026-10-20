@@ -1,6 +1,6 @@
 # API secrets intentionally do not belong in this file. Use environment variables.
 database:
-  # Generated configs use an OS-appropriate path from os.UserConfigDir.
+  # Generated configs use an OS-appropriate user data directory.
   path: dorker.db
 scheduler:
   workers: 5
@@ -21,8 +21,16 @@ http:
   max_body_bytes: 4194304
 validation:
   mode: conservative
+discovery:
+  max_depth: 3
+  max_hosts: 5000
+  max_queries: 10000
+  max_duration: 30m
+  saturation_threshold: 0.03
+  saturation_consecutive_depths: 2
 output:
   collapse: none
+  # Generated configs resolve the user's home directory to an absolute path.
   directory: ~/dorker-output
 ui:
   banner: true

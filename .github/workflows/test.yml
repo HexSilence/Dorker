@@ -6,7 +6,7 @@ name: test
 permissions:
   contents: read
 jobs:
-  test:
+  native:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
@@ -18,7 +18,40 @@ jobs:
         with:
           go-version: ${{ matrix.go }}
           cache: true
+      - run: go version
+      - run: go mod download
+      - run: go mod verify
       - run: go test ./...
       - run: go vet ./...
+      - name: Build and run native binary
+        shell: bash
+        run: |
+          suffix=""
+          if [ "${{ runner.os }}" = "Windows" ]; then suffix=".exe"; fi
+          ci_tmp="$(mktemp -d)"
+          go build -o "$ci_tmp/dorker-native$suffix" ./cmd/dorker
+          "$ci_tmp/dorker-native$suffix" version
+          "$ci_tmp/dorker-native$suffix" --help
+          "$ci_tmp/dorker-native$suffix" search --help
+          "$ci_tmp/dorker-native$suffix" discover --help
+          "$ci_tmp/dorker-native$suffix" ghdb --help
+          "$ci_tmp/dorker-native$suffix" setup --help
+      - name: Install and run outside the repository
+        shell: bash
+        run: |
+          suffix=""
+          if [ "${{ runner.os }}" = "Windows" ]; then suffix=".exe"; fi
+          ci_tmp="$(mktemp -d)"
+          install_bin="$ci_tmp/dorker-gobin"
+          outside="$ci_tmp/dorker-outside"
+          mkdir -p "$install_bin" "$outside"
+          GOBIN="$install_bin" go install ./cmd/dorker
+          test -f "$install_bin/dorker$suffix"
+          cd "$outside"
+          export DORKER_CONFIG="$outside/config.yaml"
+          "$install_bin/dorker$suffix" version
+          "$install_bin/dorker$suffix" --help
+          "$install_bin/dorker$suffix"
+          "$install_bin/dorker$suffix" doctor
       - if: runner.os == 'Linux'
         run: go test -race ./...

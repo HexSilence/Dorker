@@ -42,10 +42,6 @@ Run `dorker config check`. Unknown YAML fields, unsupported enum values, invalid
 
 Check `output.directory` and `--output-dir`. The current user must be able to create directories and files there. Dorker should not be run with sudo to work around ownership problems.
 
-## Private repository installation fails
-
-Confirm the GitHub account has repository access and Git authentication already works. Then configure `GOPRIVATE=github.com/HexSilence/*`. Do not place personal access tokens in clone or module URLs.
-
 ## Windows PATH issue
 
 The usual location is `%USERPROFILE%\go\bin`, but use `go env GOBIN` and `go env GOPATH` as the source of truth. Change the user Path, not the system Path, unless system-wide administration is intentional.

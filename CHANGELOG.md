@@ -7,3 +7,6 @@
 - TXT, JSONL, and CSV exports with host/domain collapse modes.
 - Safe automatic output for interactive searches.
 - Configuration initialization/checking, environment doctor, and guided setup.
+- Bounded recursive discovery with a persistent frontier, leases, owned artifacts,
+  safe resume, and degraded/trustworthy terminal-evidence semantics.
+- First-run config bootstrap and OS-native config/state paths.

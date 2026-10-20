@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"github.com/HexSilence/dorker/internal/model"
 	"github.com/HexSilence/dorker/internal/provider"
+	"github.com/HexSilence/dorker/internal/query"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -18,13 +20,15 @@ type Config struct {
 	BaseURL                                       string
 }
 type Client struct {
-	cfg      Config
-	health   *provider.HealthTracker
-	mu       sync.Mutex
-	attempts map[string]int
+	cfg         Config
+	health      *provider.HealthTracker
+	mu          sync.Mutex
+	attempts    map[string]int
+	dynamicBase bool
 }
 
 func New(c Config) *Client {
+	dynamicBase := c.BaseURL == ""
 	if c.Name == "" {
 		c.Name = "mock"
 	}
@@ -34,7 +38,7 @@ func New(c Config) *Client {
 	if c.BaseURL == "" {
 		c.BaseURL = "https://example.test"
 	}
-	return &Client{cfg: c, health: provider.NewHealth(provider.Ready), attempts: map[string]int{}}
+	return &Client{cfg: c, health: provider.NewHealth(provider.Ready), attempts: map[string]int{}, dynamicBase: dynamicBase}
 }
 func (c *Client) Name() string                  { return c.cfg.Name }
 func (c *Client) Health() provider.HealthStatus { return c.health.Snapshot() }
@@ -69,8 +73,18 @@ func (c *Client) Search(ctx context.Context, r provider.SearchRequest) (out prov
 		return out, nil
 	}
 	end := min(start+size, c.cfg.Total)
+	baseURL := c.cfg.BaseURL
+	if c.dynamicBase {
+		if constraints, e := query.ExtractConstraints(r.OriginalQuery); e == nil && len(constraints.Sites) > 0 {
+			host := constraints.Sites[0].Value
+			if !strings.Contains(host, ".") {
+				host = "example." + host
+			}
+			baseURL = "https://" + host
+		}
+	}
 	for i := start; i < end; i++ {
-		u := fmt.Sprintf("%s/result/%d?utm_source=mock", c.cfg.BaseURL, i)
+		u := fmt.Sprintf("%s/result/%d?utm_source=mock", baseURL, i)
 		out.Results = append(out.Results, model.Result{URL: u, Title: fmt.Sprintf("Result %d", i), Provider: c.Name(), OriginalQuery: r.OriginalQuery, QueryVariant: r.Query, Rank: i + 1, Page: strconv.Itoa(r.Page), DiscoveredAt: time.Now().UTC()})
 	}
 	out.Done = end >= c.cfg.Total

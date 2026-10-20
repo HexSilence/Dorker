@@ -13,7 +13,7 @@ func TestBannerEnabledDisabled(t *testing.T) {
 	var b bytes.Buffer
 	r := New(&b, Options{Banner: true, Interactive: true, Color: ColorNever})
 	r.Banner()
-	if !strings.Contains(b.String(), "D O R K E R") || !strings.Contains(b.String(), "Silence && Fro7h") {
+	if !strings.Contains(b.String(), "D O R K E R") || !strings.Contains(b.String(), "Silence") {
 		t.Fatal(b.String())
 	}
 	b.Reset()
@@ -64,11 +64,11 @@ func TestBannerTextAndSpacing(t *testing.T) {
 		"│           & Reconnaissance Engine            │\n" +
 		"│                                              │\n" +
 		"│          Developed & Engineered by           │\n" +
-		"│               Silence && Fro7h               │\n" +
+		"│                   Silence                    │\n" +
 		"│                                              │\n" +
 		"│   Built for Precision • Driven by Research   │\n" +
-		"│                © 2026 Dorker                 │\n" +
-		"│             All Rights Reserved              │\n" +
+		"│              © 2026 HexSilence               │\n" +
+		"│              Apache License 2.0              │\n" +
 		"└──────────────────────────────────────────────┘\n\n"
 	if b.String() != want {
 		t.Fatalf("banner mismatch:\n%s", b.String())

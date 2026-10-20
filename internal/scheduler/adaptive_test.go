@@ -116,6 +116,20 @@ func TestDuplicateOnlySaturatesButDegradedEmptyDoesNot(t *testing.T) {
 	})
 }
 
+func TestUsefulPageWithSourceDegradationRemainsDegraded(t *testing.T) {
+	st, col, vs := adaptiveFixture(t)
+	r := model.Result{URL: "https://example.test/a", Provider: "searxng", SourceEngines: []string{"bing"}, OriginalQuery: "q", QueryVariant: "q", DiscoveredAt: time.Now()}
+	p := &sequenceProvider{name: "searxng", responses: []provider.SearchResponse{{Results: []model.Result{r}, Done: true, Diagnostics: []provider.UpstreamDiagnostic{{Provider: "searxng", Engine: "brave", Classification: provider.UpstreamRateLimited}}}}}
+	s := New(st, col, slog.New(slog.NewTextHandler(io.Discard, nil)), Options{Workers: 1, MaxPages: 10, PageSize: 10, Retry: rl.RetryPolicy{MaxAttempts: 1}})
+	if err := s.Run(context.Background(), "job", vs, []Runtime{NewRuntime(p, 1000, 1)}, nil); err != nil {
+		t.Fatal(err)
+	}
+	report := s.Report()
+	if report.UsefulPages != 1 || !report.Degraded || report.Partial || report.ProviderFailures != 0 {
+		t.Fatalf("%+v", report)
+	}
+}
+
 func TestCooldownIsPersistedAndDoesNotBlockByDefault(t *testing.T) {
 	st, col, vs := adaptiveFixture(t)
 	p := &sequenceProvider{name: "p", errors: []error{&provider.Error{Kind: provider.KindRateLimited, Message: "slow down", RetryAfter: time.Minute}}}
@@ -133,5 +147,8 @@ func TestCooldownIsPersistedAndDoesNotBlockByDefault(t *testing.T) {
 	}
 	if !s.Report().Partial {
 		t.Fatalf("%+v", s.Report())
+	}
+	if s.Report().ProviderFailures != 1 || s.Report().ErrorPages != 1 {
+		t.Fatalf("provider failure/error attempt accounting=%+v", s.Report())
 	}
 }

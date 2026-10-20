@@ -79,6 +79,7 @@ type Collector struct {
 	OnUnique                                                            func(string)
 	OnRejected                                                          func(model.Result, query.ValidationResult)
 	ValidationMode                                                      query.ValidationMode
+	ScopeConstraints                                                    *query.QueryConstraints
 	Raw, Accepted, Rejected, UnknownKept, Unique, Duplicates, Malformed atomic.Int64
 	constraints                                                         sync.Map
 	reasonsMu                                                           sync.Mutex
@@ -94,13 +95,16 @@ func (c *Collector) RejectionReasons() map[query.ValidationReason]int64 {
 	}
 	return out
 }
-func (c *Collector) constraintsFor(raw string) query.QueryConstraints {
+func (c *Collector) constraintsFor(raw string) (query.QueryConstraints, error) {
 	if v, ok := c.constraints.Load(raw); ok {
-		return v.(query.QueryConstraints)
+		return v.(query.QueryConstraints), nil
 	}
-	x, _ := query.ExtractConstraints(raw)
+	x, err := query.ExtractConstraints(raw)
+	if err != nil {
+		return x, fmt.Errorf("parse query constraints: %w", err)
+	}
 	actual, _ := c.constraints.LoadOrStore(raw, x)
-	return actual.(query.QueryConstraints)
+	return actual.(query.QueryConstraints), nil
 }
 
 func (c *Collector) Add(ctx context.Context, r model.Result) (bool, error) {
@@ -116,13 +120,24 @@ func (c *Collector) AddBatch(ctx context.Context, results []model.Result) (int, 
 		n, d, err := c.Normalizer.Normalize(r.URL)
 		if err != nil {
 			c.Malformed.Add(1)
+			c.addReason(query.ReasonMalformedURL)
 			continue
 		}
 		mode := c.ValidationMode
 		if mode == "" {
 			mode = query.ValidationConservative
 		}
-		vr := c.constraintsFor(r.OriginalQuery).Evaluate(n, mode)
+		constraints, err := c.constraintsFor(r.OriginalQuery)
+		if err != nil {
+			return 0, err
+		}
+		vr := constraints.Evaluate(n, mode)
+		if vr.Decision != "REJECT" && c.ScopeConstraints != nil {
+			scopeResult := c.ScopeConstraints.Evaluate(n, mode)
+			if scopeResult.Decision == "REJECT" {
+				vr = scopeResult
+			}
+		}
 		if vr.Decision == "REJECT" {
 			c.Rejected.Add(1)
 			c.reasonsMu.Lock()
@@ -167,4 +182,13 @@ func (c *Collector) AddBatch(ctx context.Context, results []model.Result) (int, 
 		}
 	}
 	return count, nil
+}
+
+func (c *Collector) addReason(reason query.ValidationReason) {
+	c.reasonsMu.Lock()
+	defer c.reasonsMu.Unlock()
+	if c.reasons == nil {
+		c.reasons = map[query.ValidationReason]int64{}
+	}
+	c.reasons[reason]++
 }

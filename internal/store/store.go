@@ -58,7 +58,7 @@ func (s *Store) Flush(ctx context.Context) error {
 func (s *Store) init(ctx context.Context) error {
 	const schema = `
 PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
-CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, options_json TEXT NOT NULL DEFAULT '{}');
+CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, options_json TEXT NOT NULL DEFAULT '{}', run_owner TEXT NOT NULL DEFAULT '', lease_until TEXT);
 CREATE TABLE IF NOT EXISTS queries(id INTEGER PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id), original TEXT NOT NULL, UNIQUE(job_id,original));
 CREATE TABLE IF NOT EXISTS query_variants(id INTEGER PRIMARY KEY, query_id INTEGER NOT NULL REFERENCES queries(id), variant TEXT NOT NULL, ordinal INTEGER NOT NULL, UNIQUE(query_id,variant));
 CREATE TABLE IF NOT EXISTS urls(id INTEGER PRIMARY KEY, normalized_url TEXT NOT NULL UNIQUE, domain TEXT NOT NULL, first_seen TEXT NOT NULL);
@@ -69,7 +69,14 @@ CREATE TABLE IF NOT EXISTS job_metrics(job_id TEXT PRIMARY KEY REFERENCES jobs(i
 CREATE TABLE IF NOT EXISTS validation_reasons(job_id TEXT NOT NULL REFERENCES jobs(id), reason TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(job_id,reason));
 CREATE TABLE IF NOT EXISTS upstream_engine_events(job_id TEXT NOT NULL REFERENCES jobs(id), provider TEXT NOT NULL, provider_instance TEXT NOT NULL DEFAULT '', engine TEXT NOT NULL, classification TEXT NOT NULL, message TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 1, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, last_query TEXT NOT NULL DEFAULT '', last_page INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(job_id,provider,provider_instance,engine,classification,message,last_query,last_page));
 CREATE TABLE IF NOT EXISTS page_outcomes(job_id TEXT NOT NULL REFERENCES jobs(id), provider TEXT NOT NULL, query_variant TEXT NOT NULL, page INTEGER NOT NULL, outcome TEXT NOT NULL, raw INTEGER NOT NULL DEFAULT 0, accepted INTEGER NOT NULL DEFAULT 0, rejected INTEGER NOT NULL DEFAULT 0, unknown_kept INTEGER NOT NULL DEFAULT 0, duplicates INTEGER NOT NULL DEFAULT 0, unique_yield INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, PRIMARY KEY(job_id,provider,query_variant,page));
-CREATE INDEX IF NOT EXISTS idx_urls_domain ON urls(domain); CREATE INDEX IF NOT EXISTS idx_discoveries_job ON discoveries(job_id); CREATE INDEX IF NOT EXISTS idx_discoveries_provider ON discoveries(provider); CREATE INDEX IF NOT EXISTS idx_progress_job ON provider_progress(job_id);`
+CREATE TABLE IF NOT EXISTS discovery_jobs(job_id TEXT PRIMARY KEY REFERENCES jobs(id), seed_query TEXT NOT NULL, options_json TEXT NOT NULL, current_depth INTEGER NOT NULL DEFAULT 0, low_gain_streak INTEGER NOT NULL DEFAULT 0, stop_reason TEXT NOT NULL DEFAULT '', output_path TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL, finished_at TEXT);
+CREATE TABLE IF NOT EXISTS discovery_hosts(job_id TEXT NOT NULL REFERENCES jobs(id), host TEXT NOT NULL, registrable_domain TEXT NOT NULL DEFAULT '', depth INTEGER NOT NULL, parent_host TEXT NOT NULL DEFAULT '', state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, seed_derived INTEGER NOT NULL DEFAULT 0, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, PRIMARY KEY(job_id,host));
+CREATE TABLE IF NOT EXISTS discovery_edges(job_id TEXT NOT NULL REFERENCES jobs(id), parent_host TEXT NOT NULL DEFAULT '', child_host TEXT NOT NULL, query TEXT NOT NULL, provider TEXT NOT NULL DEFAULT '', provider_instance TEXT NOT NULL DEFAULT '', source_engine TEXT NOT NULL DEFAULT '', first_seen TEXT NOT NULL, PRIMARY KEY(job_id,parent_host,child_host,query,provider,provider_instance,source_engine));
+CREATE TABLE IF NOT EXISTS discovery_depth_stats(job_id TEXT NOT NULL REFERENCES jobs(id), depth INTEGER NOT NULL, accepted_urls INTEGER NOT NULL DEFAULT 0, new_urls INTEGER NOT NULL DEFAULT 0, hosts_observed INTEGER NOT NULL DEFAULT 0, new_hosts INTEGER NOT NULL DEFAULT 0, roots_observed INTEGER NOT NULL DEFAULT 0, new_roots INTEGER NOT NULL DEFAULT 0, queries_executed INTEGER NOT NULL DEFAULT 0, provider_failures INTEGER NOT NULL DEFAULT 0, rejected_results INTEGER NOT NULL DEFAULT 0, duplicate_results INTEGER NOT NULL DEFAULT 0, gain_ratio REAL NOT NULL DEFAULT 0, trustworthy INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(job_id,depth));
+CREATE INDEX IF NOT EXISTS idx_discovery_hosts_frontier ON discovery_hosts(job_id,state,depth,host);
+CREATE INDEX IF NOT EXISTS idx_discovery_hosts_root ON discovery_hosts(job_id,registrable_domain);
+CREATE INDEX IF NOT EXISTS idx_discovery_edges_child ON discovery_edges(job_id,child_host);
+CREATE INDEX IF NOT EXISTS idx_urls_domain ON urls(domain); CREATE INDEX IF NOT EXISTS idx_discoveries_job ON discoveries(job_id); CREATE INDEX IF NOT EXISTS idx_discoveries_job_query ON discoveries(job_id,original_query); CREATE INDEX IF NOT EXISTS idx_discoveries_provider ON discoveries(provider); CREATE INDEX IF NOT EXISTS idx_progress_job ON provider_progress(job_id);`
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return err
 	}
@@ -96,6 +103,17 @@ CREATE INDEX IF NOT EXISTS idx_urls_domain ON urls(domain); CREATE INDEX IF NOT 
 			return err
 		}
 	}
+	for _, col := range []struct{ name, def string }{
+		{"run_owner", "TEXT NOT NULL DEFAULT ''"},
+		{"lease_until", "TEXT"},
+	} {
+		if err := s.ensureColumn(ctx, "jobs", col.name, col.def); err != nil {
+			return err
+		}
+	}
+	if err := s.ensureColumn(ctx, "discovery_jobs", "output_path", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	return s.migrateDiscoveryIdentity(ctx)
 }
 
@@ -119,6 +137,7 @@ func (s *Store) migrateDiscoveryIdentity(ctx context.Context) error {
 		`INSERT INTO discoveries(id,job_id,url_id,original_url,title,snippet,provider,provider_instance,source_engines,original_query,query_variant,rank,page,discovered_at) SELECT id,job_id,url_id,original_url,title,snippet,provider,provider_instance,source_engines,original_query,query_variant,rank,page,discovered_at FROM discoveries_v1`,
 		`DROP TABLE discoveries_v1`,
 		`CREATE INDEX IF NOT EXISTS idx_discoveries_job ON discoveries(job_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_discoveries_job_query ON discoveries(job_id,original_query)`,
 		`CREATE INDEX IF NOT EXISTS idx_discoveries_provider ON discoveries(provider)`,
 	}
 	for _, q := range statements {
@@ -158,7 +177,7 @@ func (s *Store) ensureColumn(ctx context.Context, table, column, definition stri
 
 func (s *Store) CreateJob(ctx context.Context, id, options string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err := s.db.ExecContext(ctx, `INSERT INTO jobs(id,status,created_at,updated_at,options_json) VALUES(?,?,?,?,?)`, id, "running", now, now, options)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO jobs(id,status,created_at,updated_at,options_json) VALUES(?,?,?,?,?)`, id, "PENDING", now, now, options)
 	return err
 }
 func (s *Store) SetJobStatus(ctx context.Context, id, status string) error {

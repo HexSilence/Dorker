@@ -54,6 +54,7 @@ const (
 
 type Report struct {
 	UsefulPages, CleanEmptyPages, DegradedEmptyPages, DuplicateOnlyPages, ErrorPages int
+	ProviderFailures                                                                 int
 	Saturated, Degraded, Partial                                                     bool
 	SaturationReason                                                                 string
 }
@@ -186,6 +187,7 @@ func (s *Scheduler) runTask(ctx context.Context, job string, t task) error {
 		if !s.Options.WaitForRecovery || time.Until(p.CooldownUntil) > s.Options.MaxRecoveryWait {
 			s.reportMu.Lock()
 			s.report.Partial = true
+			s.report.ProviderFailures++
 			s.reportMu.Unlock()
 			return nil
 		}
@@ -220,6 +222,10 @@ func (s *Scheduler) runTask(ctx context.Context, job string, t task) error {
 			p.LastOutcome = string(ErrorPage)
 			if kind == provider.KindQuota || kind == provider.KindUnauthorized || kind == provider.KindInvalidQuery {
 				p.State = stringsForKind(kind)
+				s.reportMu.Lock()
+				s.report.Partial = true
+				s.report.ProviderFailures++
+				s.reportMu.Unlock()
 				_ = s.Store.Event(ctx, job, p.Provider, string(kind), err.Error())
 				return s.Store.SaveProgress(ctx, p)
 			}
@@ -227,6 +233,7 @@ func (s *Scheduler) runTask(ctx context.Context, job string, t task) error {
 				p.State = "FAILED"
 				s.reportMu.Lock()
 				s.report.Partial = true
+				s.report.ProviderFailures++
 				s.reportMu.Unlock()
 				_ = s.Store.Event(ctx, job, p.Provider, "failure", err.Error())
 				if e := s.Store.SaveProgress(ctx, p); e != nil {
@@ -245,6 +252,7 @@ func (s *Scheduler) runTask(ctx context.Context, job string, t task) error {
 			if !s.Options.WaitForRecovery || waited+delay > s.Options.MaxRecoveryWait {
 				s.reportMu.Lock()
 				s.report.Partial = true
+				s.report.ProviderFailures++
 				s.reportMu.Unlock()
 				return nil
 			}
@@ -274,6 +282,15 @@ func (s *Scheduler) runTask(ctx context.Context, job string, t task) error {
 		p.Attempts = 0
 		p.LastError = ""
 		p.LastErrorClass = ""
+		// Query provenance is scheduler-owned. Providers supply result content but
+		// cannot broaden local scope by omitting or replacing the query metadata.
+		for i := range resp.Results {
+			resp.Results[i].OriginalQuery = req.OriginalQuery
+			resp.Results[i].QueryVariant = req.Query
+			if resp.Results[i].Provider == "" {
+				resp.Results[i].Provider = p.Provider
+			}
+		}
 		s.collectMu.Lock()
 		rawBefore, acceptedBefore := s.Collector.Raw.Load(), s.Collector.Accepted.Load()
 		rejectedBefore, unknownBefore := s.Collector.Rejected.Load(), s.Collector.UnknownKept.Load()

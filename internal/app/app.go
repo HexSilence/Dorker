@@ -73,6 +73,7 @@ func Run(args []string, streams IO) int {
 		args = args[1:]
 	}
 	if len(args) == 0 {
+		created, bootstrapErr := config.Bootstrap("")
 		cfg, err := config.Load("")
 		if err != nil {
 			cfg = config.Default()
@@ -80,6 +81,13 @@ func Run(args []string, streams IO) int {
 		r := renderer(streams, cfg, streams.Quiet, streams.NoBanner)
 		r.Banner()
 		r.Startup()
+		if bootstrapErr != nil {
+			fmt.Fprintf(streams.Err, "\nConfig was not created: %v\nRun `dorker setup` after fixing the path.\n", bootstrapErr)
+			return 1
+		}
+		if created {
+			fmt.Fprintf(streams.Err, "\nConfig created\n  %s\n", config.DefaultPath())
+		}
 		return 0
 	}
 	if args[0] == "--help" || args[0] == "-h" {
@@ -99,7 +107,11 @@ func Run(args []string, streams IO) int {
 	} else {
 		args = args[1:]
 	}
-	if len(args) > 0 && (args[0] == "--help" || args[0] == "-h") && cmd != "search" && cmd != "resume" {
+	if len(args) > 0 && (args[0] == "--help" || args[0] == "-h") {
+		if cmd == "search" {
+			ui.SearchHelpColor(streams.Out, config.DefaultPath(), streamColor(streams, ui.ColorAuto), ui.IsTerminal(streams.Out) || streams.Color == "always")
+			return 0
+		}
 		if ui.CommandHelp(streams.Out, cmd, config.DefaultPath()) {
 			return 0
 		}
@@ -108,14 +120,28 @@ func Run(args []string, streams IO) int {
 		ui.CommandHelp(streams.Out, "providers test", config.DefaultPath())
 		return 0
 	}
+	if cmd == "setup" && len(args) > 1 && args[0] == "searxng" && (args[1] == "--help" || args[1] == "-h") {
+		ui.CommandHelp(streams.Out, "setup searxng", config.DefaultPath())
+		return 0
+	}
+	if (cmd == "config" || cmd == "query") && len(args) > 1 && (args[1] == "--help" || args[1] == "-h") {
+		if ui.CommandHelp(streams.Out, cmd, config.DefaultPath()) {
+			return 0
+		}
+	}
 	switch cmd {
 	case "search":
 		return runSearch(args, streams, "", false, searchOrigin{})
+	case "discover":
+		return runDiscover(args, streams, "", false)
 	case "resume":
 		id := ""
 		if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 			id = args[0]
 			args = args[1:]
+		}
+		if id != "" && isDiscoveryJob(args, id) {
+			return runDiscover(args, streams, id, true)
 		}
 		return runSearch(args, streams, id, true, searchOrigin{})
 	case "providers":
@@ -508,10 +534,10 @@ func runSearch(args []string, ioo IO, resumeID string, resuming bool, origin sea
 	if len(runtimes) == 0 && !o.DryRun {
 		for _, name := range o.Providers {
 			if name == "searxng" {
-				return fail(ioo.Err, 3, errors.New("no SearXNG instance is available right now"))
+				return fail(ioo.Err, 3, errors.New("no SearXNG instance is available right now\nrun `dorker setup` or set SEARXNG_URL, then check with `dorker providers`"))
 			}
 		}
-		return fail(ioo.Err, 3, errors.New("no configured provider is available right now"))
+		return fail(ioo.Err, 3, errors.New("no configured provider is available right now\nrun `dorker setup`, then check readiness with `dorker providers`"))
 	}
 	stdin := false
 	if f, ok := ioo.In.(*os.File); ok {
@@ -608,11 +634,16 @@ func runSearch(args []string, ioo IO, resumeID string, resuming bool, origin sea
 			return fail(ioo.Err, 1, err)
 		}
 		if err = st.AddVariants(context.Background(), job, vs); err != nil {
+			_ = st.SetJobStatus(context.Background(), job, "FAILED")
 			return fail(ioo.Err, 1, err)
 		}
 	}
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	parent, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	ctx, owner, lease, err := acquireJobLease(parent, st, job)
+	if err != nil {
+		return fail(ioo.Err, 1, err)
+	}
 	col := &collector.Collector{Store: st, JobID: job, Normalizer: normalize.New(normalize.Options{KeepTracking: o.KeepTracking}), Filter: filter, ValidationMode: validationMode}
 	col.OnRejected = func(r model.Result, vr query.ValidationResult) {
 		reason := "constraint_mismatch"
@@ -641,6 +672,10 @@ func runSearch(args []string, ioo IO, resumeID string, resuming bool, origin sea
 	log.Info("job started", "job", job, "queries", len(vs), "providers", len(runtimes))
 	err = sched.Run(ctx, job, vs, runtimes, progress)
 	stopProgress()
+	leaseErr := lease.Stop()
+	if leaseErr != nil {
+		err = leaseErr
+	}
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cleanupCancel()
 	report := sched.Report()
@@ -662,7 +697,10 @@ func runSearch(args []string, ioo IO, resumeID string, resuming bool, origin sea
 	if err != nil && !errors.Is(err, context.Canceled) {
 		log.Error("job failed", "error", err)
 	}
-	if e := st.SetJobStatus(cleanupCtx, job, status); e != nil && code == 0 {
+	if leaseErr != nil {
+		status, code = "FAILED", 1
+	}
+	if e := st.FinishJob(cleanupCtx, job, owner, status); e != nil && code == 0 {
 		err = e
 		code = 1
 	}
@@ -703,7 +741,7 @@ func runSearch(args []string, ioo IO, resumeID string, resuming bool, origin sea
 		var e error
 		outputCount, e = exporter.WriteCollapsed(cleanupCtx, st, job, o.Format, exportDestination, o.Overwrite, ioo.Out, collapseMode)
 		if e != nil {
-			return fail(ioo.Err, 1, e)
+			return fail(ioo.Err, 1, fmt.Errorf("write output %q: %w\nchoose a writable path with --output or --output-dir", exportDestination, e))
 		}
 	} else if code == 0 && collapseMode != exporter.CollapseNone {
 		// Interactive searches may have no destination, but the human summary still
@@ -929,6 +967,9 @@ func runProviderTest(args []string, ioo IO) int {
 	if err != nil {
 		return fail(ioo.Err, 2, err)
 	}
+	if pc, ok := cfg.Providers[name]; ok && !pc.Enabled {
+		return fail(ioo.Err, 3, fmt.Errorf("%s is disabled; enable it in the configuration before testing", name))
+	}
 	runtimes, statuses := providers(cfg, httpclient.New(cfg.HTTP), []string{name})
 	known, configured := false, false
 	for _, s := range statuses {
@@ -1014,6 +1055,9 @@ func runJobs(args []string, ioo IO) int {
 		return fail(ioo.Err, 1, err)
 	}
 	defer st.Close()
+	if _, err = st.RecoverStaleJobs(context.Background(), time.Now()); err != nil {
+		return fail(ioo.Err, 1, err)
+	}
 	jobs, err := st.Jobs(context.Background())
 	if err != nil {
 		return fail(ioo.Err, 1, err)
@@ -1134,7 +1178,7 @@ func runExport(args []string, ioo IO) int {
 	}
 	defer st.Close()
 	if _, err = exporter.WriteCollapsed(context.Background(), st, job, *format, *out, *overwrite, ioo.Out, mode); err != nil {
-		return fail(ioo.Err, 1, err)
+		return fail(ioo.Err, 1, fmt.Errorf("write output %q: %w\nchoose a writable path with --output", *out, err))
 	}
 	return 0
 }
@@ -1174,9 +1218,18 @@ func runConfigInit(args []string, ioo IO) int {
 
 func writeStarterConfig(path string, force bool, ioo IO) int {
 	path = config.ExpandPath(path)
-	if _, err := os.Stat(path); err == nil && !force {
-		return fail(ioo.Err, 2, fmt.Errorf("config already exists\n%s", path))
-	} else if err != nil && !os.IsNotExist(err) {
+	if !force {
+		created, err := config.Bootstrap(path)
+		if err != nil {
+			return fail(ioo.Err, 1, err)
+		}
+		if !created {
+			return fail(ioo.Err, 2, fmt.Errorf("config already exists\n%s", path))
+		}
+		fmt.Fprintf(ioo.Out, "Config created\n  %s\n", path)
+		return 0
+	}
+	if _, err := os.Stat(path); err != nil && !os.IsNotExist(err) {
 		return fail(ioo.Err, 1, err)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
@@ -1186,7 +1239,7 @@ func writeStarterConfig(path string, force bool, ioo IO) int {
 	if err != nil {
 		return fail(ioo.Err, 1, err)
 	}
-	if err = os.WriteFile(path, b, 0600); err != nil {
+	if err = writeFileAtomic(path, b, 0600); err != nil {
 		return fail(ioo.Err, 1, err)
 	}
 	fmt.Fprintf(ioo.Out, "Config created\n  %s\n", path)
@@ -1203,8 +1256,9 @@ func runDoctor(args []string, ioo IO) int {
 	if fs.NArg() != 0 {
 		return fail(ioo.Err, 2, errors.New("unexpected arguments"))
 	}
-	fmt.Fprintln(ioo.Out, "Dorker Doctor")
+	fmt.Fprintln(ioo.Out, "DORKER / DOCTOR")
 	fmt.Fprintln(ioo.Out)
+	fmt.Fprintf(ioo.Out, "  %-14s %s\n", "Version", buildinfo.String())
 	fmt.Fprintf(ioo.Out, "  %-14s Ready · %s/%s\n", "Platform", runtime.GOOS, runtime.GOARCH)
 	if v, err := exec.Command("go", "version").Output(); err == nil {
 		fields := strings.Fields(string(v))
@@ -1221,20 +1275,25 @@ func runDoctor(args []string, ioo IO) int {
 		fmt.Fprintf(ioo.Out, "  %-14s Problem · %s\n", "Config", err)
 		return 1
 	}
-	if _, err = os.Stat(config.ExpandPath(*path)); err == nil {
-		fmt.Fprintf(ioo.Out, "  %-14s Ready\n", "Config")
+	configPath := config.ExpandPath(*path)
+	if _, err = os.Stat(configPath); err == nil {
+		fmt.Fprintf(ioo.Out, "  %-14s Ready · %s\n", "Config", configPath)
 	} else {
-		fmt.Fprintf(ioo.Out, "  %-14s Not created · run dorker setup\n", "Config")
+		fmt.Fprintf(ioo.Out, "  %-14s Not created · %s\n", "Config", configPath)
 	}
-	if err = os.MkdirAll(filepath.Dir(config.ExpandPath(cfg.Database.Path)), 0700); err == nil {
-		fmt.Fprintf(ioo.Out, "  %-14s Ready\n", "Database")
+	dbPath := config.ExpandPath(cfg.Database.Path)
+	if writablePath(dbPath, false) == nil {
+		fmt.Fprintf(ioo.Out, "  %-14s Ready · %s\n", "Database", dbPath)
 	} else {
-		fmt.Fprintf(ioo.Out, "  %-14s Problem\n", "Database")
+		fmt.Fprintf(ioo.Out, "  %-14s Problem · parent directory is not writable\n", "Database")
+		return 1
 	}
-	if err = os.MkdirAll(config.ExpandPath(cfg.Output.Directory), 0755); err == nil {
-		fmt.Fprintf(ioo.Out, "  %-14s Ready · %s\n", "Output dir", config.ExpandPath(cfg.Output.Directory))
+	outputPath := config.ExpandPath(cfg.Output.Directory)
+	if writablePath(outputPath, true) == nil {
+		fmt.Fprintf(ioo.Out, "  %-14s Ready · %s\n", "Output dir", outputPath)
 	} else {
-		fmt.Fprintf(ioo.Out, "  %-14s Problem\n", "Output dir")
+		fmt.Fprintf(ioo.Out, "  %-14s Problem · path is not writable\n", "Output dir")
+		return 1
 	}
 	for _, name := range []string{"podman", "docker"} {
 		if _, e := exec.LookPath(name); e == nil {
@@ -1249,14 +1308,52 @@ func runDoctor(args []string, ioo IO) int {
 		if s.Configured && s.Enabled {
 			available++
 		}
+		state := "missing configuration or credentials"
+		if !s.Enabled {
+			state = "disabled"
+		} else if s.Configured {
+			state = "ready to test"
+		}
+		fmt.Fprintf(ioo.Out, "    %-12s %s\n", s.Name, state)
 	}
 	fmt.Fprintf(ioo.Out, "  %-14s %d available\n", "Providers", available)
 	if available == 0 {
-		fmt.Fprintln(ioo.Out, "\nNo search provider is configured. Run `dorker setup`.")
-		return 1
+		fmt.Fprintln(ioo.Out, "\nNo search provider is ready yet. Run `dorker setup`.")
+		return 0
 	}
 	fmt.Fprintln(ioo.Out, "\nEverything looks good.")
 	return 0
+}
+
+func writablePath(path string, directory bool) error {
+	probe := path
+	if !directory {
+		probe = filepath.Dir(path)
+	}
+	for {
+		info, err := os.Stat(probe)
+		if err == nil {
+			if !info.IsDir() {
+				return errors.New("not a directory")
+			}
+			f, openErr := os.CreateTemp(probe, ".dorker-doctor-*")
+			if openErr != nil {
+				return openErr
+			}
+			name := f.Name()
+			_ = f.Close()
+			_ = os.Remove(name)
+			return nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return err
+		}
+		probe = parent
+	}
 }
 
 func runSetup(args []string, ioo IO) int {
@@ -1273,6 +1370,7 @@ func runSetup(args []string, ioo IO) int {
 		return fail(ioo.Err, 2, errors.New("unexpected arguments"))
 	}
 	fmt.Fprintln(ioo.Out, "Dorker Setup")
+	fmt.Fprintf(ioo.Out, "\nEnvironment\n  OS             %s\n  Architecture   %s\n  Config         %s\n", runtime.GOOS, runtime.GOARCH, config.ExpandPath(*path))
 	if _, err := os.Stat(config.ExpandPath(*path)); os.IsNotExist(err) {
 		if code := writeStarterConfig(*path, false, ioo); code != 0 {
 			return code
@@ -1280,11 +1378,121 @@ func runSetup(args []string, ioo IO) int {
 	} else {
 		fmt.Fprintf(ioo.Out, "\nConfig\n  Ready · %s\n", config.ExpandPath(*path))
 	}
-	fmt.Fprintln(ioo.Out, "\nSearch provider\n  Local SearXNG: dorker setup searxng\n  Existing SearXNG: set SEARXNG_URL or edit the generated config\n  Brave: set BRAVE_API_KEY\n  Google: set GOOGLE_API_KEY and GOOGLE_CSE_ID\n  SerpAPI: set SERPAPI_API_KEY\n\nCredentials are read from the environment and are never printed.")
+	runtimeName := "not detected (optional)"
+	for _, name := range []string{"podman", "docker"} {
+		if _, err := setupLookPath(name); err == nil {
+			runtimeName = name + " detected"
+			break
+		}
+	}
+	fmt.Fprintf(ioo.Out, "\nSearch backend\n  Container      %s\n  Local SearXNG  dorker setup searxng\n  Existing       set SEARXNG_URL or edit the generated config\n  Brave          set BRAVE_API_KEY\n  Google         set GOOGLE_API_KEY and GOOGLE_CSE_ID\n  SerpAPI        enable it and set SERPAPI_API_KEY\n\nRecommended\n  Preview safe local setup: dorker setup searxng\n\nCredentials are read from the environment and are never printed.\n", runtimeName)
 	return 0
 }
 
 const searxImage = "ghcr.io/searxng/searxng:2026.10.4-d48c4b555@sha256:b0497f6e93b5e98b1a15c66b333afed176266af34f479a46ed87514f4a441eda"
+
+const (
+	searxContainer        = "dorker-searxng"
+	searxSettingsTarget   = "/etc/searxng/settings.yml"
+	searxSettingsLabel    = "io.github.hexsilence.dorker.searxng-settings"
+	searxReadinessURL     = "http://127.0.0.1:8080/search?q=dorker&format=json"
+	searxReadinessMaxBody = 1 << 20
+)
+
+var (
+	setupLookPath = exec.LookPath
+	setupCommand  = func(name string, args ...string) ([]byte, error) { return exec.Command(name, args...).CombinedOutput() }
+	setupReady    = waitForSearXNG
+)
+
+func waitForSearXNG() bool {
+	client := &http.Client{Timeout: 2 * time.Second}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for {
+		if searXNGReady(ctx, client, searxReadinessURL, searxReadinessMaxBody) == nil {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+func searXNGReady(ctx context.Context, client *http.Client, endpoint string, maxBody int64) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("SearXNG returned HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(body)) > maxBody {
+		return errors.New("SearXNG readiness response is too large")
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(body, &object); err != nil {
+		return fmt.Errorf("invalid SearXNG JSON response: %w", err)
+	}
+	if object == nil {
+		return errors.New("SearXNG JSON response is not an object")
+	}
+	return nil
+}
+
+type searxContainerInspect struct {
+	Config struct {
+		Labels map[string]string `json:"Labels"`
+	} `json:"Config"`
+	Mounts []struct {
+		Source      string `json:"Source"`
+		Destination string `json:"Destination"`
+	} `json:"Mounts"`
+}
+
+func cleanAbsolutePath(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	return filepath.Clean(abs)
+}
+
+func inspectSearXNGContainer(runtimeName, settingsPath string) (bool, error) {
+	out, err := setupCommand(runtimeName, "inspect", searxContainer)
+	if err != nil {
+		return false, nil
+	}
+	var inspected []searxContainerInspect
+	if err := json.Unmarshal(out, &inspected); err != nil || len(inspected) != 1 {
+		return true, errors.New("cannot inspect existing dorker-searxng container configuration")
+	}
+	want := cleanAbsolutePath(settingsPath)
+	label := inspected[0].Config.Labels[searxSettingsLabel]
+	if label != "" && cleanAbsolutePath(label) != want {
+		return true, fmt.Errorf("existing dorker-searxng container belongs to settings %s; use that Dorker config or remove/rename the container manually", label)
+	}
+	for _, mount := range inspected[0].Mounts {
+		if mount.Destination == searxSettingsTarget {
+			if cleanAbsolutePath(mount.Source) == want {
+				return true, nil
+			}
+			return true, fmt.Errorf("existing dorker-searxng container belongs to settings %s; use that Dorker config or remove/rename the container manually", mount.Source)
+		}
+	}
+	return true, errors.New("existing dorker-searxng container is not managed by this Dorker config; rename it or use a separately configured SearXNG URL")
+}
 
 func setupSearXNG(args []string, ioo IO) int {
 	fs := flag.NewFlagSet("setup searxng", flag.ContinueOnError)
@@ -1292,60 +1500,61 @@ func setupSearXNG(args []string, ioo IO) int {
 	yes := fs.Bool("yes", false, "confirm container creation")
 	configPath := fs.String("config", config.DefaultPath(), "configuration path")
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		return 2
 	}
 	runtimeName := ""
 	for _, n := range []string{"podman", "docker"} {
-		if _, e := exec.LookPath(n); e == nil {
+		if _, e := setupLookPath(n); e == nil {
 			runtimeName = n
 			break
 		}
 	}
 	if runtimeName == "" {
-		fmt.Fprintln(ioo.Err, "Podman isn't installed (Docker is also supported).\n\nArch: sudo pacman -S podman\nDebian/Kali/Ubuntu: sudo apt install podman\nFedora: sudo dnf install podman\n\nRun `dorker setup searxng` again.")
+		fmt.Fprintln(ioo.Err, containerRuntimeGuidance(runtime.GOOS))
 		return 3
 	}
 	if !*yes {
 		fmt.Fprintf(ioo.Out, "This creates dorker-searxng, binds only 127.0.0.1:8080, and uses %s.\nRun again with --yes to confirm.\n", searxImage)
 		return 0
 	}
-	base := filepath.Join(filepath.Dir(config.ExpandPath(config.DefaultPath())), "searxng")
+	base := filepath.Join(filepath.Dir(config.ExpandPath(*configPath)), "searxng")
+	settingsPath := filepath.Join(base, "settings.yml")
+	exists, err := inspectSearXNGContainer(runtimeName, settingsPath)
+	if err != nil {
+		return fail(ioo.Err, 1, err)
+	}
 	if err := os.MkdirAll(base, 0700); err != nil {
 		return fail(ioo.Err, 1, err)
 	}
-	secret := make([]byte, 32)
-	if _, err := rand.Read(secret); err != nil {
-		return fail(ioo.Err, 1, err)
-	}
-	settings := fmt.Sprintf("use_default_settings: true\nserver:\n  bind_address: 0.0.0.0\n  port: 8080\n  secret_key: %s\nsearch:\n  formats:\n    - html\n    - json\n", hex.EncodeToString(secret))
-	settingsPath := filepath.Join(base, "settings.yml")
-	if err := os.WriteFile(settingsPath, []byte(settings), 0600); err != nil {
-		return fail(ioo.Err, 1, err)
+	if _, statErr := os.Stat(settingsPath); os.IsNotExist(statErr) {
+		secret := make([]byte, 32)
+		if _, err := rand.Read(secret); err != nil {
+			return fail(ioo.Err, 1, err)
+		}
+		settings := fmt.Sprintf("use_default_settings: true\nserver:\n  bind_address: 0.0.0.0\n  port: 8080\n  secret_key: %s\nsearch:\n  formats:\n    - html\n    - json\n", hex.EncodeToString(secret))
+		if err := os.WriteFile(settingsPath, []byte(settings), 0600); err != nil {
+			return fail(ioo.Err, 1, err)
+		}
+	} else if statErr != nil {
+		return fail(ioo.Err, 1, statErr)
 	}
 	mount := settingsPath + ":/etc/searxng/settings.yml:ro"
 	if runtimeName == "podman" {
 		mount += ",Z"
 	}
-	cmd := exec.Command(runtimeName, "run", "-d", "--name", "dorker-searxng", "--restart", "unless-stopped", "-p", "127.0.0.1:8080:8080", "-v", mount, searxImage)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	var out []byte
+	if exists {
+		out, err = setupCommand(runtimeName, "start", searxContainer)
+	} else {
+		out, err = setupCommand(runtimeName, "run", "-d", "--name", searxContainer, "--label", searxSettingsLabel+"="+cleanAbsolutePath(settingsPath), "--restart", "unless-stopped", "-p", "127.0.0.1:8080:8080", "-v", mount, searxImage)
+	}
+	if err != nil {
 		return fail(ioo.Err, 1, fmt.Errorf("start SearXNG: %s", strings.TrimSpace(string(out))))
 	}
-	ready := false
-	client := &http.Client{Timeout: 2 * time.Second}
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		resp, requestErr := client.Get("http://127.0.0.1:8080/search?q=dorker&format=json")
-		if requestErr == nil {
-			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-			_ = resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				ready = true
-				break
-			}
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	if !ready {
+	if !setupReady() {
 		return fail(ioo.Err, 1, errors.New("SearXNG started but did not become ready within 30 seconds"))
 	}
 	cfg, err := config.Load(*configPath)
@@ -1353,8 +1562,33 @@ func setupSearXNG(args []string, ioo IO) int {
 		return fail(ioo.Err, 1, err)
 	}
 	pc := cfg.Providers["searxng"]
-	pc.Enabled, pc.Strategy = true, "balanced"
-	pc.Instances = []config.SearXNGInstanceConfig{{Name: "local", URL: "http://127.0.0.1:8080", RequestsPerSecond: 1, Burst: 1}}
+	pc.Enabled = true
+	if pc.Strategy == "" {
+		pc.Strategy = "balanced"
+	}
+	managed := config.SearXNGInstanceConfig{Name: "local", URL: "http://127.0.0.1:8080", RequestsPerSecond: 1, Burst: 1}
+	found := false
+	for i := range pc.Instances {
+		if strings.TrimRight(pc.Instances[i].URL, "/") == managed.URL {
+			managed.Name = pc.Instances[i].Name
+			pc.Instances[i] = managed
+			found = true
+			break
+		}
+	}
+	if !found {
+		used := map[string]bool{}
+		for _, instance := range pc.Instances {
+			used[instance.Name] = true
+		}
+		if used[managed.Name] {
+			managed.Name = "dorker-local"
+			for n := 2; used[managed.Name]; n++ {
+				managed.Name = fmt.Sprintf("dorker-local-%d", n)
+			}
+		}
+		pc.Instances = append(pc.Instances, managed)
+	}
 	cfg.Providers["searxng"] = pc
 	b, err := yaml.Marshal(cfg)
 	if err != nil {
@@ -1364,11 +1598,57 @@ func setupSearXNG(args []string, ioo IO) int {
 	if err = os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return fail(ioo.Err, 1, err)
 	}
-	if err = os.WriteFile(path, b, 0600); err != nil {
+	if err = writeFileAtomic(path, b, 0600); err != nil {
 		return fail(ioo.Err, 1, err)
 	}
 	fmt.Fprintf(ioo.Out, "SearXNG is ready.\n\n  URL      http://127.0.0.1:8080\n  Runtime  %s\n  Config   %s\n", runtimeName, settingsPath)
 	return 0
+}
+
+func containerRuntimeGuidance(goos string) string {
+	switch goos {
+	case "darwin":
+		return "No container runtime was found. Install and start Podman Desktop or Docker Desktop. If Homebrew is already installed, `brew install podman` is another option. Dorker will not install system software.\n\nRun `dorker setup searxng` again afterward."
+	case "windows":
+		return "No container runtime was found. Install and start Podman Desktop or Docker Desktop (winget can locate both packages). Dorker will not install system software.\n\nConfirm `podman version` or `docker version`, then run `dorker setup searxng` again."
+	default:
+		return "No container runtime was found. Install Podman or Docker with your distribution's official instructions. Examples: Debian/Ubuntu/Kali use APT, Fedora uses DNF, and Arch uses pacman. Dorker will not run a package manager or sudo.\n\nConfirm `podman version` or `docker version`, then run `dorker setup searxng` again."
+	}
+}
+
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	f, err := os.CreateTemp(filepath.Dir(path), ".dorker-config-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if err = f.Chmod(mode); err == nil {
+		_, err = f.Write(data)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	if err = os.Rename(tmp, path); err == nil {
+		return nil
+	}
+	backup := path + ".dorker-old"
+	_ = os.Remove(backup)
+	if moveErr := os.Rename(path, backup); moveErr != nil {
+		return err
+	}
+	if err = os.Rename(tmp, path); err != nil {
+		_ = os.Rename(backup, path)
+		return err
+	}
+	_ = os.Remove(backup)
+	return nil
 }
 
 func runConfigCheck(args []string, ioo IO) int {
@@ -1443,9 +1723,15 @@ func runQuery(args []string, ioo IO) int {
 		explanation := ui.QueryExplanation{Query: args[1], ProviderText: strings.Join(c.ProviderOnly, " ")}
 		for _, s := range c.Sites {
 			explanation.Local = append(explanation.Local, ui.Constraint{Name: "site", Value: s.String()})
+			if s.Wildcard {
+				explanation.Scope = append(explanation.Scope, "allows proper subdomains of "+s.Value+" (not the bare host)")
+			} else {
+				explanation.Scope = append(explanation.Scope, "allows "+s.Value+" and its subdomains")
+			}
 		}
 		for _, s := range c.ExcludedSites {
 			explanation.Local = append(explanation.Local, ui.Constraint{Name: "exclude site", Value: s.String()})
+			explanation.Scope = append(explanation.Scope, "rejects "+s.Value+" and matching subdomains")
 		}
 		for _, x := range c.Extensions {
 			explanation.Local = append(explanation.Local, ui.Constraint{Name: "extension", Value: x})
@@ -1458,6 +1744,9 @@ func runQuery(args []string, ioo IO) int {
 		}
 		for _, x := range c.URLExcludes {
 			explanation.Local = append(explanation.Local, ui.Constraint{Name: "URL excludes", Value: x})
+		}
+		if len(c.Sites) > 0 || len(c.ExcludedSites) > 0 {
+			explanation.Scope = append(explanation.Scope, "site scope is fail-closed after URL normalization")
 		}
 		ui.New(ioo.Out, ui.Options{Color: streamColor(ioo, ui.ColorAuto), Interactive: ui.IsTerminal(ioo.Out) || ioo.Color == "always"}).QueryExplain(explanation)
 		return 0

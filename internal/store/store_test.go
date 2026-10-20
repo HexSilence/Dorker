@@ -88,11 +88,15 @@ func TestValidationAndUpstreamAggregation(t *testing.T) {
 	if err = s.UpstreamDiagnostic(ctx, "j", d); err != nil {
 		t.Fatal(err)
 	}
+	d.Message = "too many requests (alternate detail)"
+	if err = s.UpstreamDiagnostic(ctx, "j", d); err != nil {
+		t.Fatal(err)
+	}
 	st, err := s.Stats(ctx, "j")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Accepted != 6 || st.Rejected != 3 || st.UnknownKept != 1 || st.RejectionReasons["extension_mismatch"] != 2 || len(st.UpstreamDegradation) != 1 || st.UpstreamDegradation[0].Count != 2 {
+	if st.Accepted != 6 || st.Rejected != 3 || st.UnknownKept != 1 || st.RejectionReasons["extension_mismatch"] != 2 || len(st.UpstreamDegradation) != 1 || st.UpstreamDegradation[0].Count != 3 {
 		t.Fatalf("%+v", st)
 	}
 }
@@ -155,6 +159,16 @@ func TestMigrationFromPhase2Schema(t *testing.T) {
 	}
 	if instance != "" || engines != "[]" {
 		t.Fatalf("%q %q", instance, engines)
+	}
+	for _, table := range []string{"discovery_jobs", "discovery_hosts", "discovery_edges", "discovery_depth_stats"} {
+		var n int
+		if err = s.db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&n); err != nil || n != 1 {
+			t.Fatalf("migration missing %s: n=%d err=%v", table, n, err)
+		}
+	}
+	var oldCount int
+	if err = s.db.QueryRow(`SELECT count(*) FROM discoveries WHERE job_id='j'`).Scan(&oldCount); err != nil || oldCount != 1 {
+		t.Fatalf("old discoveries not preserved: %d %v", oldCount, err)
 	}
 }
 

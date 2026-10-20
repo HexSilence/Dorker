@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -22,6 +23,15 @@ type Config struct {
 	Validation ValidationConfig          `yaml:"validation"`
 	Output     OutputConfig              `yaml:"output"`
 	UI         UIConfig                  `yaml:"ui"`
+	Discovery  DiscoveryConfig           `yaml:"discovery"`
+}
+type DiscoveryConfig struct {
+	MaxDepth                    int           `yaml:"max_depth"`
+	MaxHosts                    int           `yaml:"max_hosts"`
+	MaxQueries                  int           `yaml:"max_queries"`
+	MaxDuration                 time.Duration `yaml:"max_duration"`
+	SaturationThreshold         float64       `yaml:"saturation_threshold"`
+	SaturationConsecutiveDepths int           `yaml:"saturation_consecutive_depths"`
 }
 type OutputConfig struct {
 	Collapse  string `yaml:"collapse"`
@@ -88,8 +98,9 @@ func Default() Config {
 		Retry:      RetryConfig{MaxAttempts: 4, BaseDelay: 2 * time.Second, MaxDelay: 2 * time.Minute, Jitter: true},
 		HTTP:       HTTPConfig{RequestTimeout: 20 * time.Second, ConnectTimeout: 5 * time.Second, MaxBodyBytes: 4 << 20},
 		Validation: ValidationConfig{Mode: "conservative"},
-		Output:     OutputConfig{Collapse: "none", Directory: "~/dorker-output"},
+		Output:     OutputConfig{Collapse: "none", Directory: defaultOutputPath()},
 		UI:         UIConfig{Banner: true, Color: "auto"},
+		Discovery:  DiscoveryConfig{MaxDepth: 3, MaxHosts: 5000, MaxQueries: 10000, MaxDuration: 30 * time.Minute, SaturationThreshold: 0.03, SaturationConsecutiveDepths: 2},
 		Providers: map[string]ProviderConfig{
 			"searxng":    {Enabled: true, RequestsPerSecond: 1, Burst: 1},
 			"google-api": {Enabled: true, RequestsPerSecond: 1, Burst: 1},
@@ -101,10 +112,49 @@ func Default() Config {
 }
 
 func defaultDatabasePath() string {
-	if d, err := os.UserConfigDir(); err == nil {
-		return filepath.Join(d, buildinfo.Name, buildinfo.Name+".db")
+	return filepath.Join(defaultDataDir(), buildinfo.Name+".db")
+}
+
+// DefaultDatabasePath and DefaultOutputPath expose the resolved locations for
+// diagnostics and documentation without requiring callers to duplicate OS
+// path rules.
+func DefaultDatabasePath() string { return defaultDatabasePath() }
+func DefaultOutputPath() string   { return defaultOutputPath() }
+
+func defaultDataDir() string {
+	home, _ := os.UserHomeDir()
+	configDir, _ := os.UserConfigDir()
+	return dataDirForOS(runtime.GOOS, home, configDir, os.Getenv("XDG_DATA_HOME"), os.Getenv("LOCALAPPDATA"))
+}
+
+func dataDirForOS(goos, home, configDir, xdgData, localAppData string) string {
+	switch goos {
+	case "linux":
+		if xdgData != "" {
+			return filepath.Join(xdgData, buildinfo.Name)
+		}
+		if home != "" {
+			return filepath.Join(home, ".local", "share", buildinfo.Name)
+		}
+	case "windows":
+		if localAppData != "" {
+			return filepath.Join(localAppData, buildinfo.Name)
+		}
 	}
-	return buildinfo.Name + ".db"
+	if configDir != "" {
+		return filepath.Join(configDir, buildinfo.Name)
+	}
+	if home != "" {
+		return filepath.Join(home, ".dorker")
+	}
+	return ".dorker"
+}
+
+func defaultOutputPath() string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, "dorker-output")
+	}
+	return filepath.Join(defaultDataDir(), "output")
 }
 
 func DefaultPath() string {
@@ -137,6 +187,53 @@ func Load(path string) (Config, error) {
 	return c, c.Validate()
 }
 
+// Bootstrap writes a complete default configuration atomically when none
+// exists. The hard-link publication step is atomic and cannot replace an
+// existing file, including one created concurrently by another process.
+func Bootstrap(path string) (bool, error) {
+	if path == "" {
+		path = DefaultPath()
+	}
+	path = expandHome(path)
+	if _, err := os.Stat(path); err == nil {
+		return false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("inspect config: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return false, fmt.Errorf("create config directory: %w", err)
+	}
+	b, err := yaml.Marshal(Default())
+	if err != nil {
+		return false, fmt.Errorf("encode default config: %w", err)
+	}
+	f, err := os.CreateTemp(filepath.Dir(path), ".dorker-config-*")
+	if err != nil {
+		return false, fmt.Errorf("create temporary config: %w", err)
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if err = f.Chmod(0600); err == nil {
+		_, err = f.Write(b)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return false, fmt.Errorf("write config: %w", err)
+	}
+	if err = os.Link(tmp, path); err != nil {
+		if _, statErr := os.Stat(path); statErr == nil {
+			return false, nil
+		}
+		return false, fmt.Errorf("publish config: %w", err)
+	}
+	return true, nil
+}
+
 func (c Config) Validate() error {
 	if c.UI.Color != "auto" && c.UI.Color != "always" && c.UI.Color != "never" {
 		return errors.New("ui.color must be auto, always, or never")
@@ -167,6 +264,9 @@ func (c Config) Validate() error {
 	}
 	if c.HTTP.MaxBodyBytes < 1024 {
 		return errors.New("http.max_body_bytes must be at least 1024")
+	}
+	if c.Discovery.MaxDepth < 0 || c.Discovery.MaxHosts < 1 || c.Discovery.MaxQueries < 1 || c.Discovery.MaxDuration <= 0 || c.Discovery.SaturationThreshold < 0 || c.Discovery.SaturationThreshold > 1 || c.Discovery.SaturationConsecutiveDepths < 1 {
+		return errors.New("invalid discovery limits")
 	}
 	for n, p := range c.Providers {
 		if p.RequestsPerSecond < 0 || p.Burst < 0 {

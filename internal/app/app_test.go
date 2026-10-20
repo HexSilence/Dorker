@@ -10,9 +10,14 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/HexSilence/dorker/internal/config"
+	"github.com/HexSilence/dorker/internal/discovery"
+	"github.com/HexSilence/dorker/internal/model"
 	"github.com/HexSilence/dorker/internal/scheduler"
 	"github.com/HexSilence/dorker/internal/store"
+	"gopkg.in/yaml.v3"
 )
 
 func TestProviderDiagnosticsNeverPrintSecrets(t *testing.T) {
@@ -39,6 +44,7 @@ func TestProviderDiagnosticsNeverPrintSecrets(t *testing.T) {
 }
 
 func TestNoArgumentAndHelpPresentation(t *testing.T) {
+	t.Setenv("DORKER_CONFIG", filepath.Join(t.TempDir(), "dorker", "config.yaml"))
 	var out, errout bytes.Buffer
 	if code := Run(nil, IO{In: strings.NewReader(""), Out: &out, Err: &errout}); code != 0 {
 		t.Fatal(code)
@@ -58,12 +64,64 @@ func TestNoArgumentAndHelpPresentation(t *testing.T) {
 	}
 }
 
+func TestNoArgumentBootstrapsConfigWithoutOverwrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config", "config.yaml")
+	t.Setenv("DORKER_CONFIG", path)
+	var out, stderr bytes.Buffer
+	if code := Run(nil, IO{Out: &out, Err: &stderr}); code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	first, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(first), "database:") {
+		t.Fatalf("config=%q err=%v", first, err)
+	}
+	if err = os.WriteFile(path, []byte("# user config\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	stderr.Reset()
+	if code := Run(nil, IO{Out: &out, Err: &stderr}); code != 0 {
+		t.Fatalf("second code=%d stderr=%s", code, stderr.String())
+	}
+	got, _ := os.ReadFile(path)
+	if string(got) != "# user config\n" {
+		t.Fatalf("existing config overwritten: %q", got)
+	}
+}
+
+func TestDoctorCleanMachineIsActionableAndDoesNotLeakSecrets(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	t.Setenv("BRAVE_API_KEY", "DO_NOT_PRINT_THIS_SECRET")
+	var out, stderr bytes.Buffer
+	if code := Run([]string{"doctor", "--config", path}, IO{Out: &out, Err: &stderr}); code != 0 {
+		t.Fatalf("code=%d stderr=%s out=%s", code, stderr.String(), out.String())
+	}
+	text := out.String() + stderr.String()
+	for _, want := range []string{"DORKER / DOCTOR", "Version", "Platform", "Config", "Database", "Output dir", "Providers"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing %q in %s", want, text)
+		}
+	}
+	if strings.Contains(text, "DO_NOT_PRINT_THIS_SECRET") {
+		t.Fatalf("secret leaked: %s", text)
+	}
+}
+
+func TestContainerRuntimeGuidanceByPlatform(t *testing.T) {
+	for goos, want := range map[string]string{"linux": "package manager", "darwin": "Homebrew", "windows": "winget"} {
+		got := containerRuntimeGuidance(goos)
+		if !strings.Contains(got, want) || !strings.Contains(got, "will not") {
+			t.Fatalf("%s guidance: %s", goos, got)
+		}
+	}
+}
+
 func TestSearchHelpSections(t *testing.T) {
 	var out, errout bytes.Buffer
 	if code := Run([]string{"search", "--help"}, IO{Out: &out, Err: &errout}); code != 0 {
 		t.Fatal(code)
 	}
-	text := errout.String()
+	text := out.String()
 	for _, want := range []string{"INPUT", "PROVIDERS", "LIMITS", "VALIDATION", "OUTPUT", "RECOVERY", "DISPLAY", "--quiet", "--no-banner", "--collapse MODE"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("missing %q in %s", want, text)
@@ -72,10 +130,13 @@ func TestSearchHelpSections(t *testing.T) {
 	if strings.Contains(text, "Usage of") {
 		t.Fatal(text)
 	}
+	if errout.Len() != 0 {
+		t.Fatalf("help wrote to stderr: %s", errout.String())
+	}
 }
 
 func TestCommandHelpReturnsSuccess(t *testing.T) {
-	for _, args := range [][]string{{"providers", "--help"}, {"providers", "test", "--help"}, {"query", "--help"}, {"jobs", "--help"}, {"stats", "--help"}, {"export", "--help"}, {"config", "--help"}, {"version", "--help"}} {
+	for _, args := range [][]string{{"providers", "--help"}, {"providers", "test", "--help"}, {"query", "--help"}, {"query", "validate", "--help"}, {"jobs", "--help"}, {"stats", "--help"}, {"export", "--help"}, {"config", "--help"}, {"config", "init", "--help"}, {"config", "check", "--help"}, {"version", "--help"}, {"setup", "searxng", "--help"}} {
 		var out, stderr bytes.Buffer
 		if code := Run(args, IO{Out: &out, Err: &stderr}); code != 0 {
 			t.Fatalf("%v code=%d stderr=%s", args, code, stderr.String())
@@ -374,9 +435,21 @@ func TestProviderTestRendering(t *testing.T) {
 		fmt.Fprint(w, `{"results":[{"url":"https://example.com","engines":["bing"]}],"unresponsive_engines":[["brave","too many requests"]]}`)
 	}))
 	defer s.Close()
-	t.Setenv("SEARXNG_URL", s.URL)
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	cfg := config.Default()
+	providerConfig := cfg.Providers["searxng"]
+	providerConfig.Instances = []config.SearXNGInstanceConfig{{Name: "local", URL: s.URL, RequestsPerSecond: 1, Burst: 1}}
+	cfg.Providers["searxng"] = providerConfig
+	b, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, b, 0600); err != nil {
+		t.Fatal(err)
+	}
 	var out, errout bytes.Buffer
-	if code := Run([]string{"providers", "test", "searxng"}, IO{Out: &out, Err: &errout}); code != 0 {
+	if code := Run([]string{"providers", "test", "searxng", "--config", configPath}, IO{Out: &out, Err: &errout}); code != 0 {
 		t.Fatalf("%d %s", code, errout.String())
 	}
 	for _, want := range []string{"Status", "Ready", "Instance", "local", "bing", "Responsive", "brave", "Rate limited"} {
@@ -475,6 +548,179 @@ func TestNaturalValidationError(t *testing.T) {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("missing %q in %s", want, stderr.String())
 		}
+	}
+}
+
+func TestDiscoverHostsOnlyRedirectedStdoutIsClean(t *testing.T) {
+	dir := t.TempDir()
+	var out, errout bytes.Buffer
+	interactive := false
+	code := Run([]string{"discover", "-q", "site:example.com", "--provider", "mock", "--hosts-only", "--max-depth", "1", "--max-results", "3", "--max-results-per-query", "3", "--max-pages", "1", "--db", filepath.Join(dir, "d.db"), "--config", filepath.Join(dir, "missing.yaml")}, IO{Out: &out, Err: &errout, Interactive: &interactive})
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, errout.String())
+	}
+	if got := out.String(); got != "example.com\n" {
+		t.Fatalf("stdout=%q", got)
+	}
+	for _, bad := range []string{"DORKER", "Depth", "Discovery", "Searching", "\x1b[", "INFO"} {
+		if strings.Contains(out.String(), bad) {
+			t.Fatalf("stdout contains %q: %q", bad, out.String())
+		}
+	}
+}
+
+func TestDiscoveryCoverageDiagnosticsUseStderrData(t *testing.T) {
+	result := discovery.Result{Status: "PARTIAL", StopReason: discovery.StopFrontierDegraded, Stats: []store.DiscoveryDepthStat{{Depth: 0, Trustworthy: false}}}
+	stats := model.Stats{BySourceEngine: map[string]int64{"wiby": 2, "bing": 4}, UpstreamDegradation: []model.UpstreamEngineStat{{Engine: "google", Classification: "access_denied"}, {Engine: "brave", Classification: "rate_limited"}, {Engine: "google", Classification: "challenge"}}}
+	status, terminalEvidence, detail, historical, responsive, degraded := discoveryCoverageSummary(result, stats)
+	if terminalEvidence != "INSUFFICIENT" || !historical {
+		t.Fatalf("terminal=%s historical=%v", terminalEvidence, historical)
+	}
+	var stdout, stderr bytes.Buffer
+	writeDiscoveryCoverageDiagnostics(&stderr, status, detail, responsive, degraded)
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout=%q", stdout.String())
+	}
+	for _, want := range []string{"Coverage          degraded", "Responsive sources observed  bing, wiby", "Degraded sources  brave, google", "frontier exhausted without trustworthy saturation evidence"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("missing %q in %s", want, stderr.String())
+		}
+	}
+}
+
+func TestDiscoveryTerminalEvidenceInvariant(t *testing.T) {
+	tests := []struct {
+		name     string
+		result   discovery.Result
+		coverage string
+		evidence string
+		history  bool
+	}{
+		{"unresolved", discovery.Result{Status: "PARTIAL", StopReason: discovery.StopFrontierDegraded, Stats: []store.DiscoveryDepthStat{{Trustworthy: false}, {Trustworthy: false}}}, "DEGRADED", "INSUFFICIENT", true},
+		{"recovered", discovery.Result{Status: "SATURATED", StopReason: discovery.StopSaturated, Stats: []store.DiscoveryDepthStat{{Trustworthy: false}, {Trustworthy: true}}}, "DEGRADED", "SUFFICIENT", true},
+		{"healthy", discovery.Result{Status: "SATURATED", StopReason: discovery.StopSaturated, Stats: []store.DiscoveryDepthStat{{Trustworthy: true}}}, "TRUSTWORTHY", "SUFFICIENT", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			coverage, evidence, _, history, _, _ := discoveryCoverageSummary(tc.result, model.Stats{})
+			if coverage != tc.coverage || evidence != tc.evidence || history != tc.history {
+				t.Fatalf("coverage=%s evidence=%s history=%v", coverage, evidence, history)
+			}
+			if tc.result.Status == "PARTIAL" && tc.result.StopReason == discovery.StopSaturated {
+				t.Fatal("test fixture violates terminal invariant")
+			}
+		})
+	}
+}
+
+func TestDiscoverInteractiveWritesArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	var out, errout bytes.Buffer
+	interactive := true
+	root := filepath.Join(dir, "out")
+	code := Run([]string{"discover", "-q", "site:example.com", "--provider", "mock", "--max-depth", "0", "--max-results", "2", "--max-results-per-query", "2", "--max-pages", "1", "--output-dir", root, "--db", filepath.Join(dir, "d.db"), "--config", filepath.Join(dir, "missing.yaml")}, IO{Out: &out, Err: &errout, Interactive: &interactive})
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, errout.String())
+	}
+	base := filepath.Join(root, "discover", "site-example.com")
+	for _, name := range []string{"urls.txt", "hosts.txt", "roots.txt", "discovery.json"} {
+		if _, err := os.Stat(filepath.Join(base, name)); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+func TestDiscoverResumeReusesOutputDirectory(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "d.db")
+	root := filepath.Join(dir, "out")
+	interactive := true
+	args := []string{"discover", "-q", "site:example.com", "--provider", "mock", "--max-depth", "0", "--max-results", "1", "--max-results-per-query", "1", "--max-pages", "1", "--output-dir", root, "--db", db, "--config", filepath.Join(dir, "missing.yaml")}
+	if code := Run(args, IO{Out: &bytes.Buffer{}, Err: &bytes.Buffer{}, Interactive: &interactive}); code != 0 {
+		t.Fatalf("discover code=%d", code)
+	}
+	s, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := s.Jobs(context.Background())
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("jobs=%v err=%v", jobs, err)
+	}
+	job := jobs[0].ID
+	dj, err := s.DiscoveryJob(context.Background(), job)
+	_ = s.Close()
+	if err != nil || dj.OutputPath == "" {
+		t.Fatalf("discovery job=%+v err=%v", dj, err)
+	}
+	for i := 0; i < 2; i++ {
+		var out, stderr bytes.Buffer
+		if code := Run([]string{"resume", job, "--db", db, "--config", filepath.Join(dir, "missing.yaml")}, IO{Out: &out, Err: &stderr, Interactive: &interactive}); code != 0 {
+			t.Fatalf("resume %d code=%d stderr=%s", i, code, stderr.String())
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(root, "discover"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || filepath.Join(root, "discover", entries[0].Name()) != dj.OutputPath {
+		t.Fatalf("entries=%v output=%s", entries, dj.OutputPath)
+	}
+}
+
+func TestDiscoverProviderUnavailableDoesNotLeaveRunningJob(t *testing.T) {
+	dir := t.TempDir()
+	db := filepath.Join(dir, "d.db")
+	var out, stderr bytes.Buffer
+	if code := Run([]string{"discover", "-q", "site:example.com", "--db", db, "--config", filepath.Join(dir, "missing.yaml")}, IO{Out: &out, Err: &stderr}); code != 3 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	s, err := store.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	jobs, err := s.Jobs(context.Background())
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("jobs=%v err=%v", jobs, err)
+	}
+	if jobs[0].Status != "FAILED" {
+		t.Fatalf("status=%s", jobs[0].Status)
+	}
+}
+
+func TestDiscoverExplicitOutputWinsWhenRedirected(t *testing.T) {
+	dir := t.TempDir()
+	var out, errout bytes.Buffer
+	interactive := false
+	dest := filepath.Join(dir, "artifacts")
+	code := Run([]string{"discover", "-q", "site:example.com", "--provider", "mock", "--max-depth", "0", "--max-results", "1", "--max-results-per-query", "1", "--max-pages", "1", "-o", dest, "--db", filepath.Join(dir, "d.db"), "--config", filepath.Join(dir, "missing.yaml")}, IO{Out: &out, Err: &errout, Interactive: &interactive})
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, errout.String())
+	}
+	if out.Len() != 0 {
+		t.Fatalf("stdout=%q", out.String())
+	}
+	if _, err := os.Stat(filepath.Join(dest, "discovery.json")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "out")); !os.IsNotExist(err) {
+		t.Fatalf("unexpected automatic output: %v", err)
+	}
+}
+
+func TestDiscoverZeroResultsCreatesNoAutomaticArtifacts(t *testing.T) {
+	t.Setenv("DORKER_MOCK_RESULTS", "0")
+	dir := t.TempDir()
+	var out, errout bytes.Buffer
+	interactive := true
+	root := filepath.Join(dir, "out")
+	code := Run([]string{"discover", "-q", "site:example.com", "--provider", "mock", "--max-depth", "0", "--max-pages", "1", "--output-dir", root, "--db", filepath.Join(dir, "d.db"), "--config", filepath.Join(dir, "missing.yaml")}, IO{Out: &out, Err: &errout, Interactive: &interactive})
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, errout.String())
+	}
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Fatalf("automatic root created: %v", err)
 	}
 }
 
@@ -597,5 +843,180 @@ func TestProgressLineHidesZeroCounters(t *testing.T) {
 	}
 	if got := progressLine(63, 10, 4); got != "Searching... 63 unique · 10 rejected · 4 duplicates" {
 		t.Fatal(got)
+	}
+}
+
+func TestSetupSearXNGPreservesInstancesAndIsIdempotent(t *testing.T) {
+	originalLook, originalCommand, originalReady := setupLookPath, setupCommand, setupReady
+	t.Cleanup(func() { setupLookPath, setupCommand, setupReady = originalLook, originalCommand, originalReady })
+	setupLookPath = func(name string) (string, error) { return "/fake/" + name, nil }
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	settingsPath := filepath.Join(dir, "searxng", "settings.yml")
+	containerExists := false
+	var operations []string
+	setupCommand = func(_ string, args ...string) ([]byte, error) {
+		operations = append(operations, args[0])
+		if args[0] == "inspect" && !containerExists {
+			return nil, fmt.Errorf("missing")
+		}
+		if args[0] == "inspect" {
+			return []byte(fmt.Sprintf(`[{"Config":{"Labels":{}},"Mounts":[{"Source":%q,"Destination":"/etc/searxng/settings.yml"}]}]`, settingsPath)), nil
+		}
+		if args[0] == "run" {
+			containerExists = true
+		}
+		return []byte("ok"), nil
+	}
+	setupReady = func() bool { return true }
+	cfg := config.Default()
+	pc := cfg.Providers["searxng"]
+	pc.Strategy = "coverage"
+	pc.Instances = []config.SearXNGInstanceConfig{{Name: "remote", URL: "https://search.example.test", TokenEnv: "REMOTE_TOKEN", RequestsPerSecond: 2, Burst: 3}}
+	cfg.Providers["searxng"] = pc
+	b, _ := yaml.Marshal(cfg)
+	if err := os.WriteFile(path, b, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		var out, stderr bytes.Buffer
+		if code := setupSearXNG([]string{"--yes", "--config", path}, IO{Out: &out, Err: &stderr}); code != 0 {
+			t.Fatalf("run %d code=%d stderr=%s", i, code, stderr.String())
+		}
+	}
+	got, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instances := got.Providers["searxng"].Instances
+	if len(instances) != 2 || instances[0].Name != "remote" || instances[1].Name != "local" {
+		t.Fatalf("instances=%+v", instances)
+	}
+	if got.Providers["searxng"].Strategy != "coverage" {
+		t.Fatalf("strategy overwritten: %s", got.Providers["searxng"].Strategy)
+	}
+	if strings.Join(operations, ",") != "inspect,run,inspect,start" {
+		t.Fatalf("operations=%v", operations)
+	}
+	if _, err = os.Stat(filepath.Join(dir, "searxng", "settings.yml")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSearXNGReadiness(t *testing.T) {
+	tests := []struct {
+		name, contentType, body string
+		status                  int
+		ready                   bool
+	}{
+		{"results", "application/json", `{"results":[{"url":"https://example.test"}]}`, 200, true},
+		{"empty results", "application/json", `{"results":[]}`, 200, true},
+		{"unresponsive engines", "application/json", `{"results":[],"unresponsive_engines":[["google","timeout"]]}`, 200, true},
+		{"rate limited upstream", "application/json", `{"results":[],"unresponsive_engines":[["brave","Too many requests"]]}`, 200, true},
+		{"html", "text/html", `<html>ready</html>`, 200, false},
+		{"malformed", "application/json", `{"results":`, 200, false},
+		{"http error", "application/json", `{"results":[]}`, 503, false},
+		{"array", "application/json", `[]`, 200, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", tt.contentType)
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer srv.Close()
+			err := searXNGReady(context.Background(), srv.Client(), srv.URL, 1024)
+			if (err == nil) != tt.ready {
+				t.Fatalf("ready=%v err=%v", err == nil, err)
+			}
+		})
+	}
+}
+
+func TestSearXNGReadinessTimeout(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		_, _ = w.Write([]byte(`{"results":[]}`))
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if err := searXNGReady(ctx, srv.Client(), srv.URL, 1024); err == nil {
+		t.Fatal("timeout reported ready")
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+func TestSearXNGReadinessConnectionRefused(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("connection refused")
+	})}
+	if err := searXNGReady(context.Background(), client, searxReadinessURL, 1024); err == nil {
+		t.Fatal("connection failure reported ready")
+	}
+}
+
+func TestSetupSearXNGRejectsDifferentManagedSettingsWithoutMutation(t *testing.T) {
+	originalLook, originalCommand, originalReady := setupLookPath, setupCommand, setupReady
+	t.Cleanup(func() { setupLookPath, setupCommand, setupReady = originalLook, originalCommand, originalReady })
+	setupLookPath = func(name string) (string, error) { return "/fake/" + name, nil }
+	var operations []string
+	setupCommand = func(_ string, args ...string) ([]byte, error) {
+		operations = append(operations, args[0])
+		return []byte(`[{"Config":{"Labels":{"io.github.hexsilence.dorker.searxng-settings":"/original/searxng/settings.yml"}},"Mounts":[{"Source":"/original/searxng/settings.yml","Destination":"/etc/searxng/settings.yml"}]}]`), nil
+	}
+	setupReady = func() bool { t.Fatal("readiness must not run on ownership conflict"); return false }
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	original := []byte("# preserve alternate config\n")
+	if err := os.WriteFile(path, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	var out, stderr bytes.Buffer
+	if code := setupSearXNG([]string{"--yes", "--config", path}, IO{Out: &out, Err: &stderr}); code == 0 {
+		t.Fatal("ownership conflict succeeded")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("config changed: %q err=%v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "searxng")); !os.IsNotExist(err) {
+		t.Fatalf("alternate settings directory created: %v", err)
+	}
+	if strings.Join(operations, ",") != "inspect" {
+		t.Fatalf("container was mutated: %v", operations)
+	}
+	if !strings.Contains(stderr.String(), "/original/searxng/settings.yml") {
+		t.Fatalf("non-actionable error: %s", stderr.String())
+	}
+}
+
+func TestSetupSearXNGReadinessFailureDoesNotChangeConfig(t *testing.T) {
+	originalLook, originalCommand, originalReady := setupLookPath, setupCommand, setupReady
+	t.Cleanup(func() { setupLookPath, setupCommand, setupReady = originalLook, originalCommand, originalReady })
+	setupLookPath = func(name string) (string, error) { return "/fake/" + name, nil }
+	setupCommand = func(_ string, args ...string) ([]byte, error) {
+		if args[0] == "inspect" {
+			return nil, fmt.Errorf("missing")
+		}
+		return nil, nil
+	}
+	setupReady = func() bool { return false }
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	original := []byte("# untouched when readiness fails\n")
+	if err := os.WriteFile(path, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	var out, stderr bytes.Buffer
+	if code := setupSearXNG([]string{"--yes", "--config", path}, IO{Out: &out, Err: &stderr}); code == 0 {
+		t.Fatal("readiness failure succeeded")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(got, original) {
+		t.Fatalf("config changed: %q err=%v", got, err)
 	}
 }

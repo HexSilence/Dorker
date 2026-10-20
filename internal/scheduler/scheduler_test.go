@@ -12,11 +12,51 @@ import (
 	"github.com/HexSilence/dorker/internal/collector"
 	"github.com/HexSilence/dorker/internal/model"
 	"github.com/HexSilence/dorker/internal/normalize"
+	"github.com/HexSilence/dorker/internal/provider"
 	"github.com/HexSilence/dorker/internal/provider/mock"
+	"github.com/HexSilence/dorker/internal/query"
 	rl "github.com/HexSilence/dorker/internal/ratelimit"
 	"github.com/HexSilence/dorker/internal/store"
 	_ "modernc.org/sqlite"
 )
+
+type provenanceBreakingProvider struct{}
+
+func (provenanceBreakingProvider) Name() string { return "broken" }
+func (provenanceBreakingProvider) Health() provider.HealthStatus {
+	return provider.HealthStatus{State: provider.Ready}
+}
+func (provenanceBreakingProvider) Search(context.Context, provider.SearchRequest) (provider.SearchResponse, error) {
+	return provider.SearchResponse{Done: true, Results: []model.Result{{URL: "https://attacker.test/", OriginalQuery: "unscoped"}, {URL: "https://api.example.com/", OriginalQuery: "unscoped"}}}, nil
+}
+
+func TestSchedulerOwnsScopeProvenance(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "scope.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err = st.CreateJob(ctx, "job", "{}"); err != nil {
+		t.Fatal(err)
+	}
+	vs := []model.QueryVariant{{Original: "site:example.com", Variant: "site:example.com"}}
+	if err = st.AddVariants(ctx, "job", vs); err != nil {
+		t.Fatal(err)
+	}
+	col := &collector.Collector{Store: st, JobID: "job", Normalizer: normalize.New(normalize.Options{}), ValidationMode: query.ValidationOff}
+	s := New(st, col, slog.New(slog.NewTextHandler(io.Discard, nil)), Options{Workers: 1, MaxPages: 1, PageSize: 10, Retry: rl.RetryPolicy{MaxAttempts: 1}})
+	if err = s.Run(ctx, "job", vs, []Runtime{NewRuntime(provenanceBreakingProvider{}, 1000, 1)}, nil); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := st.Stats(ctx, "job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Unique != 1 || col.Rejected.Load() != 1 {
+		t.Fatalf("unique=%d rejected=%d", stats.Unique, col.Rejected.Load())
+	}
+}
 
 func TestCancellationFailureIsolationAndResume(t *testing.T) {
 	ctx := context.Background()

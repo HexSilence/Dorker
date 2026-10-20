@@ -1,13 +1,16 @@
 package query
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestExtractConstraints(t *testing.T) {
 	cases := []struct {
 		q                string
 		sites, exts, neg int
 		provider         int
-	}{{"site:.edu ext:pdf", 1, 1, 0, 0}, {"SITE:.EDU FILETYPE:PDF", 1, 1, 0, 0}, {"site:example.com -site:private.example.com", 1, 0, 1, 0}, {"ext:pdf -ext:html", 0, 1, 1, 0}, {`"site:example.com"`, 0, 0, 0, 1}, {`"filetype:pdf"`, 0, 0, 0, 1}, {`site:example.com "annual report"`, 1, 0, 0, 1}, {`site:example.com intitle:"annual report" ext:pdf`, 1, 1, 0, 1}, {`site:example.com inurl:reports ext:pdf`, 1, 1, 0, 0}}
+	}{{"site:.edu ext:pdf", 1, 1, 0, 0}, {"SITE:.EDU FILETYPE:PDF", 1, 1, 0, 0}, {"site:example.com -site:private.example.com", 1, 0, 1, 0}, {"ext:pdf -ext:html", 0, 1, 1, 0}, {`"site:example.com"`, 0, 0, 0, 1}, {`site:"example.com"`, 1, 0, 0, 0}, {`"filetype:pdf"`, 0, 0, 0, 1}, {`site:example.com "annual report"`, 1, 0, 0, 1}, {`site:example.com intitle:"annual report" ext:pdf`, 1, 1, 0, 1}, {`site:example.com inurl:reports ext:pdf`, 1, 1, 0, 0}}
 	for _, tc := range cases {
 		c, err := ExtractConstraints(tc.q)
 		if err != nil {
@@ -68,6 +71,82 @@ func TestNegativeSiteAndInURL(t *testing.T) {
 			t.Errorf("%s got %s", u, g)
 		}
 	}
+}
+func TestSiteScopeIsMandatoryWhenValidationOff(t *testing.T) {
+	c, _ := ExtractConstraints("site:example.com -site:dev.example.com ext:pdf")
+	for _, tc := range []struct {
+		u    string
+		want string
+	}{{"https://example.com/page.html", "ACCEPT"}, {"https://www.example.com/page.html", "ACCEPT"}, {"https://dev.example.com/a.pdf", "REJECT"}, {"https://a.dev.example.com/a.pdf", "REJECT"}, {"https://example.com.attacker.test/a.pdf", "REJECT"}} {
+		if got := c.Evaluate(tc.u, ValidationOff).Decision; got != tc.want {
+			t.Errorf("%s got %s", tc.u, got)
+		}
+	}
+}
+func TestMultiplePositiveSitesAreAlternatives(t *testing.T) {
+	c, _ := ExtractConstraints("site:example.com site:example.org")
+	for _, u := range []string{"https://example.com/", "https://a.example.org/"} {
+		if c.Evaluate(u, ValidationConservative).Decision != "ACCEPT" {
+			t.Errorf("rejected %s", u)
+		}
+	}
+	if c.Evaluate("https://example.net/", ValidationConservative).Decision != "REJECT" {
+		t.Fatal("accepted unrelated host")
+	}
+}
+func TestCountrySuffixBoundaryFixture(t *testing.T) {
+	c, _ := ExtractConstraints("site:.ye")
+	for _, u := range []string{"https://example.ye/", "https://example.com.ye/", "https://a.example.edu.ye/"} {
+		if c.Evaluate(u, ValidationConservative).Decision != "ACCEPT" {
+			t.Errorf("rejected %s", u)
+		}
+	}
+	for _, u := range []string{"https://example.yemen/", "https://example.ye.attacker.test/", "https://fakeye.test/", "https://attacker.test/?u=https://example.ye"} {
+		if c.Evaluate(u, ValidationConservative).Decision != "REJECT" {
+			t.Errorf("accepted %s", u)
+		}
+	}
+}
+func TestOtherLocalConstraintBoundaries(t *testing.T) {
+	for _, tc := range []struct{ q, u, want string }{{"filetype:pdf", "https://x.test/a.PDF", "ACCEPT"}, {"-filetype:pdf", "https://x.test/a.pdf", "REJECT"}, {"inurl:admin", "https://x.test/path/admin?q=1", "ACCEPT"}, {"-inurl:admin", "https://x.test/path?next=admin", "REJECT"}} {
+		c, _ := ExtractConstraints(tc.q)
+		if got := c.Evaluate(tc.u, ValidationStrict).Decision; got != tc.want {
+			t.Errorf("%s %s got %s", tc.q, tc.u, got)
+		}
+	}
+}
+func TestMalformedAndMissingHostFailClosed(t *testing.T) {
+	c, _ := ExtractConstraints("site:example.com")
+	for _, u := range []string{"%zz", "https:///path"} {
+		if got := c.Evaluate(u, ValidationConservative); got.Decision != "REJECT" {
+			t.Errorf("accepted %q", u)
+		}
+	}
+}
+func TestSiteIPAndPortHandling(t *testing.T) {
+	for _, tc := range []struct{ q, u string }{{"site:192.0.2.1", "http://192.0.2.1:8080/a"}, {"site:[2001:db8::1]", "https://[2001:db8::1]:8443/a"}} {
+		c, err := ExtractConstraints(tc.q)
+		if err != nil || c.Evaluate(tc.u, ValidationConservative).Decision != "ACCEPT" {
+			t.Errorf("%s %s: %v", tc.q, tc.u, err)
+		}
+	}
+	if _, err := ExtractConstraints("site:example.com:443"); err == nil {
+		t.Fatal("site constraint containing port must be rejected")
+	}
+}
+func FuzzSiteMatcherLabelBoundaries(f *testing.F) {
+	for _, s := range []string{"example.com", "www.example.com", "notexample.com", "example.com.attacker.test", "EXAMPLE.COM."} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, h string) {
+		s := SiteConstraint{Value: "example.com"}
+		got := SiteMatch(h, s)
+		lower := strings.ToLower(strings.TrimSuffix(h, "."))
+		want := lower == "example.com" || strings.HasSuffix(lower, ".example.com")
+		if got != want {
+			t.Fatalf("%q got %v want %v", h, got, want)
+		}
+	})
 }
 func BenchmarkExtractConstraints(b *testing.B) {
 	for b.Loop() {
