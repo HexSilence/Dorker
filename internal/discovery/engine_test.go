@@ -8,11 +8,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/HexSilence/dorker/internal/collector"
 	"github.com/HexSilence/dorker/internal/model"
+	"github.com/HexSilence/dorker/internal/normalize"
+	"github.com/HexSilence/dorker/internal/query"
 	"github.com/HexSilence/dorker/internal/store"
 )
 
 func newEngineStore(t *testing.T, opts Options) *store.Store {
+	return newEngineStoreForSeed(t, opts, "site:example.test")
+}
+
+func newEngineStoreForSeed(t *testing.T, opts Options, seed string) *store.Store {
 	t.Helper()
 	s, err := store.Open(filepath.Join(t.TempDir(), "d.db"))
 	if err != nil {
@@ -23,10 +30,63 @@ func newEngineStore(t *testing.T, opts Options) *store.Store {
 	if err = s.CreateJob(ctx, "job", "{}"); err != nil {
 		t.Fatal(err)
 	}
-	if err = s.CreateDiscoveryJob(ctx, store.DiscoveryJob{JobID: "job", SeedQuery: "site:example.test", OptionsJSON: EncodeOptions(opts), StartedAt: time.Now().UTC()}); err != nil {
+	if err = s.CreateDiscoveryJob(ctx, store.DiscoveryJob{JobID: "job", SeedQuery: seed, OptionsJSON: EncodeOptions(opts), StartedAt: time.Now().UTC()}); err != nil {
 		t.Fatal(err)
 	}
 	return s
+}
+
+func TestSuffixScopedSeedPreservesValidResultsWhenCoverageDegraded(t *testing.T) {
+	o := DefaultOptions()
+	o.MaxDepth = 0
+	s := newEngineStoreForSeed(t, o, "site:.sa")
+	ctx := context.Background()
+	scope, err := query.ExtractConstraints("site:.sa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	col := &collector.Collector{Store: s, JobID: "job", Normalizer: normalize.New(normalize.Options{}), ValidationMode: query.ValidationConservative, ScopeConstraints: &scope}
+	urls := []string{
+		"https://example.sa/", "https://www.example.sa/", "https://foo.gov.sa/", "https://docs.example.sa/report.pdf",
+		"https://example.sa.attacker.test/", "https://attacker.test/example.sa", "https://attacker.test/?next=example.sa", "://malformed",
+	}
+	var summary ProcessingSummary
+	runner := RunnerFunc(func(ctx context.Context, vs []model.QueryVariant) (RunReport, error) {
+		results := make([]model.Result, 0, len(urls))
+		for _, raw := range urls {
+			results = append(results, model.Result{URL: raw, Provider: "searxng", OriginalQuery: vs[0].Original, QueryVariant: vs[0].Variant, DiscoveredAt: time.Now().UTC()})
+		}
+		if _, err := col.AddBatch(ctx, results); err != nil {
+			return RunReport{}, err
+		}
+		return RunReport{Degraded: true, Raw: len(urls), Normalized: len(urls) - 1, Accepted: 4, Rejected: 3, Malformed: 1, RejectionReasons: map[string]int{"site_mismatch": 3, "malformed_url": 1}}, nil
+	})
+	got, err := (&Engine{Store: s, Runner: runner, OnProcessing: func(v ProcessingSummary) { summary = v }}).Run(ctx, "job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Hosts != 4 || got.Stats[0].NewHosts != 4 || got.Stats[0].AcceptedURLs != 4 {
+		t.Fatalf("result=%+v stats=%+v", got, got.Stats)
+	}
+	if got.Status != "PARTIAL" || got.Stats[0].Trustworthy {
+		t.Fatalf("degraded coverage was lost: %+v", got)
+	}
+	if summary.FrontierAdded != 4 || summary.HostsExtracted != 4 || summary.DuplicateHosts != 0 || summary.Rejected != 3 || summary.Malformed != 1 {
+		t.Fatalf("summary=%+v", summary)
+	}
+	hosts, err := s.DiscoveryHosts(ctx, "job")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"docs.example.sa", "example.sa", "foo.gov.sa", "www.example.sa"}
+	if len(hosts) != len(want) {
+		t.Fatalf("hosts=%+v", hosts)
+	}
+	for i := range want {
+		if hosts[i].Host != want[i] {
+			t.Fatalf("hosts=%+v", hosts)
+		}
+	}
 }
 
 func TestRecursiveFrontierAndZeroGainSaturation(t *testing.T) {

@@ -574,6 +574,21 @@ func TestDiscoverHostsOnlyRedirectedStdoutIsClean(t *testing.T) {
 	}
 }
 
+func TestDiscoverDebugReportsSeedProcessingCounters(t *testing.T) {
+	dir := t.TempDir()
+	var out, stderr bytes.Buffer
+	interactive := false
+	code := Run([]string{"discover", "-q", "site:example.com", "--provider", "mock", "--max-depth", "0", "--max-results", "3", "--max-results-per-query", "3", "--max-pages", "1", "--log-level", "debug", "--db", filepath.Join(dir, "d.db"), "--config", filepath.Join(dir, "missing.yaml")}, IO{Out: &out, Err: &stderr, Interactive: &interactive})
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	for _, want := range []string{`msg="discovery seed processing"`, "depth=0", "raw=3", "normalized=3", "accepted=3", "rejected=0", "hosts_extracted=3", "duplicate_hosts=2", "frontier_added=1"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("missing %q in %s", want, stderr.String())
+		}
+	}
+}
+
 func TestDiscoveryCoverageDiagnosticsUseStderrData(t *testing.T) {
 	result := discovery.Result{Status: "PARTIAL", StopReason: discovery.StopFrontierDegraded, Stats: []store.DiscoveryDepthStat{{Depth: 0, Trustworthy: false}}}
 	stats := model.Stats{BySourceEngine: map[string]int64{"wiby": 2, "bing": 4}, UpstreamDegradation: []model.UpstreamEngineStat{{Engine: "google", Classification: "access_denied"}, {Engine: "brave", Classification: "rate_limited"}, {Engine: "google", Classification: "challenge"}}}

@@ -49,14 +49,15 @@ const (
 	CleanEmpty    PageOutcome = "CLEAN_EMPTY"
 	DegradedEmpty PageOutcome = "DEGRADED_EMPTY"
 	DuplicateOnly PageOutcome = "DUPLICATE_ONLY"
+	RejectedOnly  PageOutcome = "REJECTED_ONLY"
 	ErrorPage     PageOutcome = "ERROR"
 )
 
 type Report struct {
-	UsefulPages, CleanEmptyPages, DegradedEmptyPages, DuplicateOnlyPages, ErrorPages int
-	ProviderFailures                                                                 int
-	Saturated, Degraded, Partial                                                     bool
-	SaturationReason                                                                 string
+	UsefulPages, CleanEmptyPages, DegradedEmptyPages, DuplicateOnlyPages, RejectedOnlyPages, ErrorPages int
+	ProviderFailures                                                                                    int
+	Saturated, Degraded, Partial                                                                        bool
+	SaturationReason                                                                                    string
 }
 type task struct {
 	rt Runtime
@@ -85,6 +86,8 @@ func (s *Scheduler) record(outcome PageOutcome) {
 		s.report.Partial = true
 	case DuplicateOnly:
 		s.report.DuplicateOnlyPages++
+	case RejectedOnly:
+		s.report.RejectedOnlyPages++
 	case ErrorPage:
 		s.report.ErrorPages++
 		s.report.Degraded = true
@@ -97,8 +100,14 @@ func ClassifyPage(resp provider.SearchResponse, marginalUnique, accepted int, er
 	if marginalUnique > 0 {
 		return UsefulPage
 	}
-	if len(resp.Results) > 0 || accepted > 0 {
+	if accepted > 0 {
 		return DuplicateOnly
+	}
+	// Provider noise rejected by local scope enforcement is not a duplicate.
+	// Keep paginating within the configured hard limit: a later page can still
+	// contain valid in-scope results.
+	if len(resp.Results) > 0 {
+		return RejectedOnly
 	}
 	if len(resp.Diagnostics) > 0 || len(resp.PartialErrors) > 0 {
 		return DegradedEmpty

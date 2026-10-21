@@ -107,6 +107,24 @@ func TestCountrySuffixBoundaryFixture(t *testing.T) {
 		}
 	}
 }
+
+func TestSASuffixAndNegativeBoundaries(t *testing.T) {
+	positive, _ := ExtractConstraints("site:.sa")
+	for _, u := range []string{"https://example.sa/", "https://www.example.sa/", "https://gov.sa/", "https://foo.gov.sa/"} {
+		if positive.Evaluate(u, ValidationConservative).Decision != "ACCEPT" {
+			t.Errorf("positive suffix rejected %s", u)
+		}
+	}
+	for _, u := range []string{"https://example.sa.attacker.test/", "https://attacker.test/example.sa", "https://attacker.test/?next=example.sa", "https://attacker-sa.test/", "https://notsa.test/"} {
+		if positive.Evaluate(u, ValidationConservative).Decision != "REJECT" {
+			t.Errorf("positive suffix accepted %s", u)
+		}
+	}
+	negative, _ := ExtractConstraints("-site:.sa")
+	if negative.Evaluate("https://foo.gov.sa/", ValidationConservative).Decision != "REJECT" || negative.Evaluate("https://example.com/", ValidationConservative).Decision != "ACCEPT" {
+		t.Fatal("negative suffix boundary failed")
+	}
+}
 func TestOtherLocalConstraintBoundaries(t *testing.T) {
 	for _, tc := range []struct{ q, u, want string }{{"filetype:pdf", "https://x.test/a.PDF", "ACCEPT"}, {"-filetype:pdf", "https://x.test/a.pdf", "REJECT"}, {"inurl:admin", "https://x.test/path/admin?q=1", "ACCEPT"}, {"-inurl:admin", "https://x.test/path?next=admin", "REJECT"}} {
 		c, _ := ExtractConstraints(tc.q)

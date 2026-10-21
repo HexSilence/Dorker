@@ -13,6 +13,7 @@ import (
 	"github.com/HexSilence/dorker/internal/model"
 	"github.com/HexSilence/dorker/internal/normalize"
 	"github.com/HexSilence/dorker/internal/provider"
+	"github.com/HexSilence/dorker/internal/query"
 	rl "github.com/HexSilence/dorker/internal/ratelimit"
 	"github.com/HexSilence/dorker/internal/store"
 )
@@ -56,6 +57,7 @@ func TestPageOutcomeClassification(t *testing.T) {
 		{"clean empty", provider.SearchResponse{}, 0, 0, nil, CleanEmpty},
 		{"degraded empty", degraded, 0, 0, nil, DegradedEmpty},
 		{"duplicate only", provider.SearchResponse{Results: []model.Result{{URL: "https://example.test/a"}}}, 0, 1, nil, DuplicateOnly},
+		{"rejected only", provider.SearchResponse{Results: []model.Result{{URL: "https://attacker.test/a"}}}, 0, 0, nil, RejectedOnly},
 		{"error", provider.SearchResponse{}, 0, 0, context.DeadlineExceeded, ErrorPage},
 	}
 	for _, tc := range tests {
@@ -64,6 +66,25 @@ func TestPageOutcomeClassification(t *testing.T) {
 				t.Fatalf("got %s want %s", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestRejectedOnlyPageDoesNotPreventLaterInScopeResults(t *testing.T) {
+	st, col, vs := adaptiveFixture(t)
+	scope, err := query.ExtractConstraints("site:.sa")
+	if err != nil {
+		t.Fatal(err)
+	}
+	col.ScopeConstraints = &scope
+	bad := model.Result{URL: "https://attacker.test/example.sa", Provider: "p", DiscoveredAt: time.Now()}
+	good := model.Result{URL: "https://example.sa/", Provider: "p", DiscoveredAt: time.Now()}
+	p := &sequenceProvider{name: "p", responses: []provider.SearchResponse{{Results: []model.Result{bad}}, {Results: []model.Result{bad}}, {Results: []model.Result{good}, Done: true}}}
+	s := New(st, col, slog.New(slog.NewTextHandler(io.Discard, nil)), Options{Workers: 1, MaxPages: 10, PageSize: 10, SaturationEnabled: true, ConsecutiveZeroYieldPages: 2, Retry: rl.RetryPolicy{MaxAttempts: 1}})
+	if err = s.Run(context.Background(), "job", vs, []Runtime{NewRuntime(p, 1000, 1)}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if p.calls != 3 || col.Unique.Load() != 1 || s.Report().Saturated || s.Report().RejectedOnlyPages != 2 {
+		t.Fatalf("calls=%d unique=%d report=%+v", p.calls, col.Unique.Load(), s.Report())
 	}
 }
 

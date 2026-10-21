@@ -239,7 +239,10 @@ func runDiscover(args []string, ioo IO, resumeID string, resuming bool) int {
 	}
 	col := &collector.Collector{Store: st, JobID: job, Normalizer: normalize.New(normalize.Options{}), ValidationMode: mode, ScopeConstraints: &scopeConstraints}
 	runner := discovery.RunnerFunc(func(runctx context.Context, vs []model.QueryVariant) (discovery.RunReport, error) {
+		beforeRaw, beforeAccepted := col.Raw.Load(), col.Accepted.Load()
 		beforeRejected, beforeDuplicates := col.Rejected.Load(), col.Duplicates.Load()
+		beforeMalformed := col.Malformed.Load()
+		beforeReasons := col.RejectionReasons()
 		if err := st.AddVariants(runctx, job, vs); err != nil {
 			return discovery.RunReport{}, err
 		}
@@ -255,7 +258,15 @@ func runDiscover(args []string, ioo IO, resumeID string, resuming bool) int {
 		sched := scheduler.New(st, col, log, scheduler.Options{Workers: cfg.Scheduler.Workers, MaxPages: dopts.MaxPages, MaxResults: remaining, MaxResultsPerQuery: dopts.MaxResultsPerQuery, PageSize: o.PageSize, Retry: rl.RetryPolicy{MaxAttempts: cfg.Retry.MaxAttempts, BaseDelay: cfg.Retry.BaseDelay, MaxDelay: cfg.Retry.MaxDelay, Jitter: cfg.Retry.Jitter}, SaturationEnabled: cfg.Scheduler.Saturation.Enabled, ConsecutiveZeroYieldPages: cfg.Scheduler.Saturation.ConsecutiveZeroYieldPages, WaitForRecovery: cfg.Scheduler.Recovery.Wait, MaxRecoveryWait: cfg.Scheduler.Recovery.MaxWait})
 		err = sched.Run(runctx, job, vs, runtimes, progress)
 		r := sched.Report()
-		return discovery.RunReport{Partial: r.Partial, Degraded: r.Degraded, ProviderFailures: r.ProviderFailures, Rejected: int(col.Rejected.Load() - beforeRejected), Duplicates: int(col.Duplicates.Load() - beforeDuplicates)}, err
+		reasons := map[string]int{}
+		for reason, count := range col.RejectionReasons() {
+			if delta := count - beforeReasons[reason]; delta > 0 {
+				reasons[string(reason)] = int(delta)
+			}
+		}
+		raw := int(col.Raw.Load() - beforeRaw)
+		malformed := int(col.Malformed.Load() - beforeMalformed)
+		return discovery.RunReport{Partial: r.Partial, Degraded: r.Degraded, ProviderFailures: r.ProviderFailures, Raw: raw, Normalized: raw - malformed, Accepted: int(col.Accepted.Load() - beforeAccepted), Malformed: malformed, Rejected: int(col.Rejected.Load() - beforeRejected), Duplicates: int(col.Duplicates.Load() - beforeDuplicates), RejectionReasons: reasons}, err
 	})
 	outUI := ui.New(ioo.Out, ui.Options{Color: streamColor(ioo, ui.ColorMode(cfg.UI.Color)), Interactive: interactive, Quiet: o.Quiet, NoBanner: true})
 	errUI := ui.New(ioo.Err, ui.Options{Color: streamColor(ioo, ui.ColorMode(cfg.UI.Color)), Interactive: ui.IsTerminal(ioo.Err), Quiet: o.Quiet, NoBanner: true})
@@ -264,6 +275,18 @@ func runDiscover(args []string, ioo IO, resumeID string, resuming bool) int {
 		fmt.Fprintf(ioo.Out, "%s  %s\n", outUI.Muted("Seed"), outUI.Value(o.Query))
 	}
 	engine := &discovery.Engine{Store: st, Runner: runner}
+	engine.OnProcessing = func(s discovery.ProcessingSummary) {
+		attrs := []any{"depth", s.Depth, "raw", s.Raw, "normalized", s.Normalized, "accepted", s.Accepted, "rejected", s.Rejected, "malformed", s.Malformed, "duplicate_urls", s.DuplicateURLs, "hosts_extracted", s.HostsExtracted, "duplicate_hosts", s.DuplicateHosts, "frontier_added", s.FrontierAdded}
+		keys := make([]string, 0, len(s.RejectionReasons))
+		for reason := range s.RejectionReasons {
+			keys = append(keys, reason)
+		}
+		sort.Strings(keys)
+		for _, reason := range keys {
+			attrs = append(attrs, "rejected_"+reason, s.RejectionReasons[reason])
+		}
+		log.Debug("discovery seed processing", attrs...)
+	}
 	engine.OnDepth = func(s store.DiscoveryDepthStat) {
 		if interactive && !o.Quiet {
 			fmt.Fprintf(ioo.Err, "%s %s · %s %s · %s %s\n", errUI.Muted("Depth"), errUI.Value(fmt.Sprint(s.Depth)), errUI.Muted("New hosts"), errUI.Value(fmt.Sprint(s.NewHosts)), errUI.Muted("Gain"), errUI.Value(fmt.Sprintf("%.2f%%", s.GainRatio*100)))

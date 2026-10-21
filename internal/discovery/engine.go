@@ -59,9 +59,11 @@ type RunReport struct {
 	// RecoveryProven is reserved for runners that can prove all coverage gaps
 	// from earlier depths were re-executed successfully. A later clean response
 	// alone is not recovery evidence.
-	RecoveryProven       bool
-	ProviderFailures     int
-	Rejected, Duplicates int
+	RecoveryProven                       bool
+	ProviderFailures                     int
+	Raw, Normalized, Accepted, Malformed int
+	Rejected, Duplicates                 int
+	RejectionReasons                     map[string]int
 }
 type Runner interface {
 	Run(context.Context, []model.QueryVariant) (RunReport, error)
@@ -76,10 +78,18 @@ type Result struct {
 	Stats                        []store.DiscoveryDepthStat
 }
 type Engine struct {
-	Store   *store.Store
-	Runner  Runner
-	Now     func() time.Time
-	OnDepth func(store.DiscoveryDepthStat)
+	Store        *store.Store
+	Runner       Runner
+	Now          func() time.Time
+	OnDepth      func(store.DiscoveryDepthStat)
+	OnProcessing func(ProcessingSummary)
+}
+
+type ProcessingSummary struct {
+	Depth, Raw, Normalized, Accepted, Rejected, Malformed int
+	DuplicateURLs, HostsExtracted, DuplicateHosts         int
+	FrontierAdded                                         int
+	RejectionReasons                                      map[string]int
 }
 
 func (e *Engine) Run(ctx context.Context, job string) (Result, error) {
@@ -182,6 +192,7 @@ func (e *Engine) Run(ctx context.Context, job string) (Result, error) {
 		seenURLs := map[string]struct{}{}
 		observed := map[string]struct{}{}
 		roots := map[string]struct{}{}
+		hostsExtracted := 0
 		newHosts := 0
 		for _, v := range variants {
 			rs, er := e.Store.ResultsForOriginalQuery(ctx, job, v.Original)
@@ -194,6 +205,7 @@ func (e *Engine) Run(ctx context.Context, job string) (Result, error) {
 				if er != nil {
 					continue
 				}
+				hostsExtracted++
 				observed[h.Name] = struct{}{}
 				if h.Registrable != "" {
 					roots[h.Registrable] = struct{}{}
@@ -218,6 +230,9 @@ func (e *Engine) Run(ctx context.Context, job string) (Result, error) {
 					}
 				}
 			}
+		}
+		if e.OnProcessing != nil {
+			e.OnProcessing(ProcessingSummary{Depth: depth, Raw: runReport.Raw, Normalized: runReport.Normalized, Accepted: runReport.Accepted, Rejected: runReport.Rejected, Malformed: runReport.Malformed, DuplicateURLs: runReport.Duplicates, HostsExtracted: hostsExtracted, DuplicateHosts: hostsExtracted - len(observed), FrontierAdded: newHosts, RejectionReasons: runReport.RejectionReasons})
 		}
 		if len(expanding) > 0 {
 			if er = e.Store.SetDiscoveryHostsState(ctx, job, expanding, "EXPANDED", false); er != nil {
