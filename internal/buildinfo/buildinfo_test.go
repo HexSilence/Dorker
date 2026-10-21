@@ -40,9 +40,9 @@ func TestResolveMetadata(t *testing.T) {
 			want: metadata{Version: ReleaseVersion},
 		},
 		{
-			name: "pseudo-version metadata",
-			info: &debug.BuildInfo{Main: debug.Module{Version: "v1.0.1-0.20261018220943-e95ad2bf0026"}},
-			want: metadata{Version: "v1.0.1-0.20261018220943-e95ad2bf0026", Commit: "e95ad2b", Date: "2026-10-18T22:09:43Z", DateKey: "commit-date"},
+			name: "pseudo-version retains release version",
+			info: &debug.BuildInfo{Main: debug.Module{Version: "v1.0.0-0.20261018220943-e95ad2bf0026+dirty"}},
+			want: metadata{Version: ReleaseVersion, Commit: "e95ad2b", Date: "2026-10-18T22:09:43Z", DateKey: "commit-date"},
 		},
 	}
 	for _, tc := range tests {

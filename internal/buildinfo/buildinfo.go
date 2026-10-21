@@ -26,7 +26,7 @@ type metadata struct {
 	DateKey string
 }
 
-var pseudoVersion = regexp.MustCompile(`^v\d+\.\d+\.\d+-(?:0\.)?(\d{14})-([0-9a-f]{12,})$`)
+var pseudoVersion = regexp.MustCompile(`^v\d+\.\d+\.\d+-(?:0\.)?(\d{14})-([0-9a-f]{12,})(?:\+.*)?$`)
 
 func init() {
 	var info *debug.BuildInfo
@@ -55,10 +55,15 @@ func String() string {
 
 func resolve(explicit metadata, info *debug.BuildInfo) metadata {
 	result := metadata{Version: ReleaseVersion}
+	moduleVersion := ""
+	if info != nil {
+		moduleVersion = info.Main.Version
+	}
+	pseudoMatch := pseudoVersion.FindStringSubmatch(moduleVersion)
 	if meaningful(explicit.Version) && explicit.Version != "(devel)" {
 		result.Version = explicit.Version
-	} else if info != nil && meaningful(info.Main.Version) && info.Main.Version != "(devel)" {
-		result.Version = info.Main.Version
+	} else if meaningful(moduleVersion) && moduleVersion != "(devel)" && pseudoMatch == nil {
+		result.Version = moduleVersion
 	}
 
 	if meaningful(explicit.Commit) {
@@ -68,8 +73,8 @@ func resolve(explicit metadata, info *debug.BuildInfo) metadata {
 		if modified, _ := buildSetting(info, "vcs.modified"); modified == "true" {
 			result.Commit += "-dirty"
 		}
-	} else if match := pseudoVersion.FindStringSubmatch(result.Version); match != nil {
-		result.Commit = shortCommit(match[2])
+	} else if pseudoMatch != nil {
+		result.Commit = shortCommit(pseudoMatch[2])
 	}
 
 	if meaningful(explicit.Date) {
@@ -80,8 +85,8 @@ func resolve(explicit metadata, info *debug.BuildInfo) metadata {
 			result.Date = parsed.UTC().Format(time.RFC3339)
 			result.DateKey = "commit-date"
 		}
-	} else if match := pseudoVersion.FindStringSubmatch(result.Version); match != nil {
-		if parsed, err := time.Parse("20060102150405", match[1]); err == nil {
+	} else if pseudoMatch != nil {
+		if parsed, err := time.Parse("20060102150405", pseudoMatch[1]); err == nil {
 			result.Date = parsed.UTC().Format(time.RFC3339)
 			result.DateKey = "commit-date"
 		}
