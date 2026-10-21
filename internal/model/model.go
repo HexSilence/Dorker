@@ -40,6 +40,11 @@ type Stats struct {
 	BySourceEngine                                                              map[string]int64
 	RejectionReasons                                                            map[string]int64
 	UpstreamDegradation                                                         []UpstreamEngineStat
+	ProviderFailures                                                            []ProviderFailure
+}
+type ProviderFailure struct {
+	Provider, Kind, Message string
+	Count                   int64
 }
 type UpstreamEngineStat struct {
 	Provider, ProviderInstance, Engine, Classification, LastMessage string

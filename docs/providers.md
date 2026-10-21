@@ -1,6 +1,6 @@
 # Providers
 
-`dorker providers` reports local configuration status. `dorker providers test NAME` performs one small live request without pagination or retry loops.
+`dorker providers` reports local configuration and eligibility without making network requests. `Ready` there means the provider is configured and can be selected. `dorker providers test NAME` performs one small live request without pagination or retry loops and reports endpoint reachability and, for SearXNG, available upstream-engine diagnostics.
 
 ## SearXNG
 
@@ -11,6 +11,8 @@ For one instance, set `SEARXNG_URL=http://127.0.0.1:8080`. For multiple instance
 ```sh
 dorker providers test searxng
 ```
+
+For a search that explicitly selects SearXNG engines, use `--provider searxng --searxng-engines engine1,engine2`. Values are trimmed, case-normalized, and deduplicated. `--searxng-strategy balanced` selects one healthy configured instance with failover; `coverage` queries every usable configured instance and merges their results. These SearXNG-only options are rejected when SearXNG is not selected.
 
 ## Brave Search API
 
@@ -49,4 +51,4 @@ The deterministic `mock` provider is for tests and local development. It is disa
 
 ## Provider behavior
 
-Each provider has bounded request rates and independent health state. Rate limits, quota failures, authentication failures, or temporary errors affect that provider task without discarding results from healthy providers. Credentials are never included in status output.
+Each provider has bounded request rates and independent health state. Rate limits, quota failures, authentication failures, transport errors, or temporary errors affect that provider task without discarding results from healthy providers. A single-provider failure is reported as such; a continuation notice is shown only when another active provider actually continued. Credentials are never included in status output.

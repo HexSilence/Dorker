@@ -65,7 +65,7 @@ func discoverFlags(errw io.Writer) (*flag.FlagSet, *discoverOptions) {
 	fs.StringVar(&o.Output, "o", "", "artifact directory (shorthand)")
 	fs.StringVar(&o.OutputDir, "output-dir", "", "automatic output root")
 	fs.StringVar(&o.Validation, "validation", "", "local validation mode")
-	fs.StringVar(&o.LogLevel, "log-level", "off", "debug, info, warn, or error")
+	fs.StringVar(&o.LogLevel, "log-level", "off", "debug, info, warn, error, or off")
 	fs.BoolVar(&o.DryRun, "dry-run", false, "show the discovery plan only")
 	fs.BoolVar(&o.Quiet, "quiet", false, "suppress progress and informational messages")
 	fs.BoolVar(&o.NoBanner, "no-banner", false, "disable the banner")
@@ -121,6 +121,14 @@ func runDiscover(args []string, ioo IO, resumeID string, resuming bool) int {
 	o.NoBanner = o.NoBanner || ioo.NoBanner
 	if o.HostsOnly && o.RootsOnly {
 		return fail(ioo.Err, 2, errors.New("--hosts-only and --roots-only are mutually exclusive"))
+	}
+	for _, name := range o.Providers {
+		if !knownProvider(name) {
+			return fail(ioo.Err, 2, fmt.Errorf("unknown provider %q", name))
+		}
+	}
+	if o.PageSize < 1 || o.PageSize > 100 || o.Workers < 0 || o.Workers > 256 {
+		return fail(ioo.Err, 2, errors.New("page-size must be between 1 and 100 and workers between 0 and 256"))
 	}
 	mode, err := query.ParseValidationMode(o.Validation)
 	if err != nil {

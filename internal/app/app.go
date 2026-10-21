@@ -386,6 +386,10 @@ func runGHDB(args []string, ioo IO) int {
 			return fail(ioo.Err, 2, fmt.Errorf("no GHDB entries in category %q", category))
 		}
 	}
+	if len(rest) > 1 && (rest[1] == "--help" || rest[1] == "-h") {
+		ui.CommandHelp(ioo.Out, "ghdb", config.DefaultPath())
+		return 0
+	}
 	r := ui.New(ioo.Out, ui.Options{Color: streamColor(ioo, ui.ColorAuto), Interactive: ui.IsTerminal(ioo.Out) || ioo.Color == "always"})
 	if len(rest) == 0 {
 		if !inputTerminal(ioo) {
@@ -586,7 +590,7 @@ type searchOptions struct {
 	Queries, Files, Providers                                              multiFlag
 	Config, DB, Mode, Format, Output, OutputDir, LogLevel, JobID, Collapse string
 	MaxVariants, Workers, MaxResults, MaxPerQuery, MaxPages, PageSize      int
-	KeepTracking, Overwrite, Stream, DryRun                                bool
+	KeepTracking, Overwrite, Stream, DryRun, Resume                        bool
 	IncludeDomains, ExcludeDomains                                         multiFlag
 	IncludeRegex, ExcludeRegex                                             string
 	SearXNGEngines, SearXNGStrategy                                        string
@@ -629,6 +633,7 @@ func searchFlags(name string, errw io.Writer, color ui.ColorMode, interactive bo
 	fs.BoolVar(&o.DryRun, "dry-run", false, "show plan without network requests or database writes")
 	fs.StringVar(&o.LogLevel, "log-level", "off", "debug, info, warn, or error; default hides internal logs")
 	fs.StringVar(&o.JobID, "job-id", "", "job ID used with --resume")
+	fs.BoolVar(&o.Resume, "resume", false, "continue the latest interrupted job (or --job-id)")
 	fs.StringVar(&o.SearXNGEngines, "searxng-engines", "", "comma-separated SearXNG engines (only sent when set)")
 	fs.StringVar(&o.SearXNGStrategy, "searxng-strategy", "", "SearXNG instance strategy: balanced or coverage")
 	fs.StringVar(&o.Validation, "validation", "", "local dork validation: off, conservative, or strict (config default)")
@@ -653,6 +658,18 @@ func runSearch(args []string, ioo IO, resumeID string, resuming bool, origin sea
 		fmt.Fprintln(ioo.Err, "unexpected positional arguments:", strings.Join(fs.Args(), " "))
 		return 2
 	}
+	if o.Resume {
+		if resuming {
+			return fail(ioo.Err, 2, errors.New("--resume may only be specified once"))
+		}
+		resuming = true
+	}
+	if o.JobID != "" && !resuming {
+		return fail(ioo.Err, 2, errors.New("--job-id requires --resume"))
+	}
+	if resuming && (len(o.Queries) > 0 || len(o.Files) > 0) {
+		return fail(ioo.Err, 2, errors.New("--resume cannot be combined with -q or -f"))
+	}
 	cfg, err := config.Load(o.Config)
 	if err != nil {
 		return fail(ioo.Err, 2, err)
@@ -672,10 +689,18 @@ func runSearch(args []string, ioo IO, resumeID string, resuming bool, origin sea
 		cfg.Scheduler.Workers = o.Workers
 	}
 	spc := cfg.Providers["searxng"]
-	if o.SearXNGEngines != "" {
-		spc.Engines = strings.Split(o.SearXNGEngines, ",")
+	engineFlag, strategyFlag := false, false
+	fs.Visit(func(f *flag.Flag) {
+		engineFlag = engineFlag || f.Name == "searxng-engines"
+		strategyFlag = strategyFlag || f.Name == "searxng-strategy"
+	})
+	if engineFlag {
+		spc.Engines, err = parseSearXNGEngines(o.SearXNGEngines)
+		if err != nil {
+			return fail(ioo.Err, 2, err)
+		}
 	}
-	if o.SearXNGStrategy != "" {
+	if strategyFlag {
 		spc.Strategy = o.SearXNGStrategy
 	}
 	cfg.Providers["searxng"] = spc
@@ -721,11 +746,38 @@ func runSearch(args []string, ioo IO, resumeID string, resuming bool, origin sea
 	if o.Format != "txt" && o.Format != "jsonl" && o.Format != "csv" {
 		return fail(ioo.Err, 2, fmt.Errorf("format must be txt, jsonl, or csv"))
 	}
-	if o.PageSize < 1 || o.PageSize > 100 || o.MaxPages < 0 || o.MaxResults < 0 || o.MaxPerQuery < 0 {
-		return fail(ioo.Err, 2, errors.New("invalid search limits"))
+	if o.PageSize < 1 || o.PageSize > 100 {
+		return fail(ioo.Err, 2, errors.New("page-size must be between 1 and 100"))
+	}
+	if o.Workers < 0 || o.Workers > 256 {
+		return fail(ioo.Err, 2, errors.New("workers must be between 0 and 256"))
+	}
+	if o.MaxPages < 0 || o.MaxResults < 0 || o.MaxPerQuery < 0 {
+		return fail(ioo.Err, 2, errors.New("result and page limits cannot be negative"))
+	}
+	if o.MaxRecoveryWait < 0 {
+		return fail(ioo.Err, 2, errors.New("max-recovery-wait cannot be negative"))
 	}
 	client := httpclient.New(cfg.HTTP)
 	runtimes, statuses := providers(cfg, client, o.Providers)
+	known := map[string]providerStatus{}
+	for _, status := range statuses {
+		known[status.Name] = status
+	}
+	for _, name := range o.Providers {
+		if _, ok := known[name]; !ok {
+			return fail(ioo.Err, 2, fmt.Errorf("unknown provider %q", name))
+		}
+	}
+	if engineFlag || strategyFlag {
+		status := known["searxng"]
+		if len(o.Providers) > 0 && !containsString(o.Providers, "searxng") {
+			return fail(ioo.Err, 2, errors.New("--searxng-engines and --searxng-strategy require --provider searxng"))
+		}
+		if !status.Selected {
+			return fail(ioo.Err, 3, errors.New("SearXNG options require an enabled, configured SearXNG provider"))
+		}
+	}
 	if len(runtimes) == 0 && !o.DryRun {
 		for _, name := range o.Providers {
 			if name == "searxng" {
@@ -845,7 +897,7 @@ func runSearch(args []string, ioo IO, resumeID string, resuming bool, origin sea
 		if len(vr.Reasons) > 0 {
 			reason = string(vr.Reasons[0])
 		}
-		log.Debug("validation rejected", "provider", r.Provider, "url", r.URL, "reason", reason)
+		log.Debug("validation rejected", "provider", r.Provider, "reason", reason)
 	}
 	if o.Stream && collapseMode == exporter.CollapseNone {
 		col.OnUnique = func(u string) { fmt.Fprintln(ioo.Out, u) }
@@ -950,7 +1002,17 @@ func runSearch(args []string, ioo IO, resumeID string, resuming bool, origin sea
 	presenter.SummaryDetails(ui.Summary{Job: job, Status: status, Output: exportDestination, SaturationReason: report.SaturationReason, Stats: stats, Collapse: o.Collapse, OutputCount: int64(outputCount)})
 	log.Info("job finished", "job", job, "status", status, "raw", stats.Raw, "accepted", stats.Accepted, "rejected", stats.Rejected, "unknown_kept", stats.UnknownKept, "unique", stats.Unique, "duplicates", stats.Duplicates, "malformed", stats.Malformed, "errors", stats.Errors)
 	if stats.Errors > 0 && !o.Quiet {
-		ui.PrintWarning(ioo.Err, fmt.Sprintf("%d provider error(s); other providers kept going", stats.Errors))
+		active := len(runtimes)
+		switch {
+		case active <= 1 && stats.Unique == 0:
+			ui.PrintWarning(ioo.Err, fmt.Sprintf("%d provider error(s); no provider remained available", stats.Errors))
+		case active <= 1:
+			ui.PrintWarning(ioo.Err, fmt.Sprintf("%d provider error(s); usable results were preserved", stats.Errors))
+		case stats.Unique > 0:
+			ui.PrintWarning(ioo.Err, fmt.Sprintf("%d provider error(s); remaining providers continued", stats.Errors))
+		default:
+			ui.PrintWarning(ioo.Err, fmt.Sprintf("%d provider error(s); all active providers failed or returned no usable data", stats.Errors))
+		}
 	}
 	if code == 130 {
 		fmt.Fprintf(ioo.Err, "job %s interrupted; resume with: %s resume %s\n", job, buildinfo.Name, job)
@@ -1098,6 +1160,46 @@ func envInt(name string, def int) int {
 	}
 	return def
 }
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func knownProvider(name string) bool {
+	switch name {
+	case "searxng", "google-api", "brave", "serpapi", "mock":
+		return true
+	default:
+		return false
+	}
+}
+
+func parseSearXNGEngines(raw string) ([]string, error) {
+	parts := strings.Split(raw, ",")
+	seen := map[string]bool{}
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		name := strings.ToLower(strings.TrimSpace(part))
+		if name == "" {
+			return nil, errors.New("--searxng-engines requires a non-empty comma-separated list")
+		}
+		for _, r := range name {
+			if r < 0x20 || r == 0x7f {
+				return nil, errors.New("--searxng-engines contains a control character")
+			}
+		}
+		if !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	return out, nil
+}
 func loadCommon(args []string, errw io.Writer) (config.Config, string, error) {
 	fs := flag.NewFlagSet("common", flag.ContinueOnError)
 	fs.SetOutput(errw)
@@ -1158,6 +1260,9 @@ func runProviderTest(args []string, ioo IO) int {
 	if fs.NArg() != 0 {
 		return fail(ioo.Err, 2, errors.New("unexpected arguments"))
 	}
+	if name != "searxng" && *instance != "" {
+		return fail(ioo.Err, 2, errors.New("--instance is only valid for the searxng provider"))
+	}
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return fail(ioo.Err, 2, err)
@@ -1204,7 +1309,11 @@ func runProviderTest(args []string, ioo IO) int {
 	resp, err := runtimes[0].Provider.Search(ctx, provider.SearchRequest{Query: *queryText, OriginalQuery: *queryText, PageSize: 1})
 	latency := time.Since(started)
 	if err != nil {
-		ui.New(ioo.Out, ui.Options{Color: ui.ColorMode(cfg.UI.Color), Interactive: ui.IsTerminal(ioo.Out)}).ProviderTest(ui.ProviderTest{Name: name, State: "FAILED", Latency: latency})
+		state := string(provider.KindOf(err))
+		if state == "" {
+			state = "FAILED"
+		}
+		ui.New(ioo.Out, ui.Options{Color: ui.ColorMode(cfg.UI.Color), Interactive: ui.IsTerminal(ioo.Out)}).ProviderTest(ui.ProviderTest{Name: name, State: state, Latency: latency})
 		fmt.Fprintf(ioo.Err, "error: %s\n", err)
 		return 1
 	}
@@ -1331,6 +1440,12 @@ func runStats(args []string, ioo IO) int {
 			fmt.Fprintf(ioo.Out, "%-18s %-14s %d  %s\n", u.Engine, u.Classification, u.Count, u.LastMessage)
 		}
 	}
+	if len(x.ProviderFailures) > 0 {
+		fmt.Fprintln(ioo.Out, "Provider failures:")
+		for _, failure := range x.ProviderFailures {
+			fmt.Fprintf(ioo.Out, "%-14s %-20s %d  %s\n", failure.Provider, failure.Kind, failure.Count, failure.Message)
+		}
+	}
 	return 0
 }
 func runExport(args []string, ioo IO) int {
@@ -1349,6 +1464,9 @@ func runExport(args []string, ioo IO) int {
 	db := fs.String("db", "", "SQLite database path override")
 	if err := fs.Parse(args[1:]); err != nil {
 		return 2
+	}
+	if fs.NArg() != 0 {
+		return fail(ioo.Err, 2, fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " ")))
 	}
 	if *out == "" {
 		return fail(ioo.Err, 2, errors.New("export requires --output"))
@@ -2073,6 +2191,9 @@ func runQuery(args []string, ioo IO) int {
 		modeText := fs.String("validation", "conservative", "off, conservative, or strict")
 		if err := fs.Parse(args[1:]); err != nil {
 			return 2
+		}
+		if fs.NArg() != 0 {
+			return fail(ioo.Err, 2, fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " ")))
 		}
 		if *q == "" || *u == "" {
 			return fail(ioo.Err, 2, errors.New("query validate requires -q and -u"))

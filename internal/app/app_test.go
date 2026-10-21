@@ -69,6 +69,110 @@ func TestNoArgumentAndHelpPresentation(t *testing.T) {
 	}
 }
 
+func TestCLIOptionValidationRegressions(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"unknown provider", []string{"search", "-q", "x", "--provider", "does-not-exist", "--dry-run"}, "unknown provider"},
+		{"job id without resume", []string{"search", "--job-id", "abc"}, "--job-id requires --resume"},
+		{"resume query conflict", []string{"search", "--resume", "-q", "x"}, "cannot be combined"},
+		{"negative workers", []string{"search", "-q", "x", "--workers", "-1", "--dry-run"}, "workers"},
+		{"negative recovery wait", []string{"search", "-q", "x", "--max-recovery-wait", "-1s", "--dry-run"}, "max-recovery-wait"},
+		{"searx engines wrong provider", []string{"search", "-q", "x", "--provider", "mock", "--searxng-engines", "duckduckgo", "--dry-run"}, "require --provider searxng"},
+		{"empty searx engines", []string{"search", "-q", "x", "--provider", "searxng", "--searxng-engines=", "--dry-run"}, "non-empty"},
+		{"discover page zero", []string{"discover", "-q", "x", "--page-size", "0", "--dry-run"}, "page-size"},
+		{"discover page too large", []string{"discover", "-q", "x", "--page-size", "101", "--dry-run"}, "page-size"},
+		{"discover workers negative", []string{"discover", "-q", "x", "--workers", "-1", "--dry-run"}, "workers"},
+		{"discover unknown provider", []string{"discover", "-q", "site:example.com", "--provider", "does-not-exist", "--dry-run"}, "unknown provider"},
+		{"query validate extra arg", []string{"query", "validate", "-q", "site:example.com", "-u", "https://example.com", "extra"}, "unexpected argument"},
+		{"instance on non-searx", []string{"providers", "test", "brave", "--instance", "local"}, "only valid for the searxng"},
+		{"export extra argument", []string{"export", "job", "-o", filepath.Join(t.TempDir(), "out.txt"), "extra"}, "unexpected arguments"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var out, stderr bytes.Buffer
+			if code := Run(tt.args, IO{In: strings.NewReader(""), Out: &out, Err: &stderr}); code != 2 {
+				t.Fatalf("code=%d stdout=%s stderr=%s", code, out.String(), stderr.String())
+			}
+			if !strings.Contains(stderr.String(), tt.want) {
+				t.Fatalf("stderr=%q want=%q", stderr.String(), tt.want)
+			}
+		})
+	}
+}
+
+func TestGHDBNestedHelpIsHelpNotInput(t *testing.T) {
+	for _, sub := range []string{"list", "show", "find", "run"} {
+		var out, stderr bytes.Buffer
+		if code := Run([]string{"ghdb", sub, "--help"}, IO{Out: &out, Err: &stderr}); code != 0 {
+			t.Fatalf("%s code=%d stderr=%s", sub, code, stderr.String())
+		}
+		if !strings.Contains(out.String(), "Usage:") {
+			t.Fatalf("%s output=%q", sub, out.String())
+		}
+	}
+}
+
+func TestParseSearXNGEngines(t *testing.T) {
+	got, err := parseSearXNGEngines(" DuckDuckGo, yahoo,DUCKDUCKGO ")
+	if err != nil || fmt.Sprint(got) != "[duckduckgo yahoo]" {
+		t.Fatalf("got=%v err=%v", got, err)
+	}
+	for _, input := range []string{"", "duckduckgo,,yahoo", "duck\nfoo"} {
+		if _, err = parseSearXNGEngines(input); err == nil {
+			t.Fatalf("input %q accepted", input)
+		}
+	}
+}
+
+func TestSingleProviderFailureDoesNotClaimOthersContinued(t *testing.T) {
+	t.Setenv("DORKER_MOCK_TEMPORARY_PAGE", "0")
+	interactive := true
+	dir := t.TempDir()
+	var out, stderr bytes.Buffer
+	code := Run([]string{"search", "-q", "example", "--provider", "mock", "--max-pages", "1", "--db", filepath.Join(dir, "x.db"), "--config", filepath.Join(dir, "missing.yaml")}, IO{Out: &out, Err: &stderr, Interactive: &interactive})
+	if code == 0 {
+		t.Fatalf("unexpected success stdout=%s stderr=%s", out.String(), stderr.String())
+	}
+	text := out.String() + stderr.String()
+	if strings.Contains(text, "other providers kept going") || strings.Contains(text, "remaining providers continued") {
+		t.Fatalf("misleading output: %s", text)
+	}
+	if !strings.Contains(text, "no provider remained available") || !strings.Contains(text, "Provider failures") {
+		t.Fatalf("missing failure detail: %s", text)
+	}
+}
+
+func TestMultiProviderPartialSaysRemainingProviderContinued(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	dir := t.TempDir()
+	cfg := config.Default()
+	searx := cfg.Providers["searxng"]
+	searx.Enabled = true
+	searx.Instances = []config.SearXNGInstanceConfig{{Name: "test", URL: server.URL}}
+	cfg.Providers["searxng"] = searx
+	configPath := filepath.Join(dir, "config.yaml")
+	raw, err := yaml.Marshal(cfg)
+	if err != nil || os.WriteFile(configPath, raw, 0600) != nil {
+		t.Fatal(err)
+	}
+	interactive := true
+	var out, stderr bytes.Buffer
+	code := Run([]string{"search", "-q", "example", "--provider", "searxng", "--provider", "mock", "--max-results", "1", "--max-pages", "1", "--validation", "off", "--db", filepath.Join(dir, "x.db"), "--config", configPath}, IO{Out: &out, Err: &stderr, Interactive: &interactive})
+	if code != 0 {
+		t.Fatalf("code=%d stdout=%s stderr=%s", code, out.String(), stderr.String())
+	}
+	text := out.String() + stderr.String()
+	if !strings.Contains(text, "remaining providers continued") || !strings.Contains(text, "server error") {
+		t.Fatalf("missing partial failure detail: %s", text)
+	}
+}
+
 func TestNoArgumentBootstrapsConfigWithoutOverwrite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config", "config.yaml")
 	t.Setenv("DORKER_CONFIG", path)

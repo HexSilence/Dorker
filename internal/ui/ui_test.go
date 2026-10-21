@@ -110,6 +110,27 @@ func TestSearchSummaries(t *testing.T) {
 	}
 }
 
+func TestEmptySearchOutcomesAreDistinct(t *testing.T) {
+	tests := []struct {
+		name  string
+		stats model.Stats
+		want  string
+	}{
+		{"clean empty", model.Stats{}, "No results found."},
+		{"all rejected", model.Stats{Raw: 3, Rejected: 3}, "all provider results were rejected by validation"},
+		{"provider failure", model.Stats{Errors: 1, ProviderFailures: []model.ProviderFailure{{Provider: "searxng", Kind: "timeout", Message: "request timed out"}}}, "Provider failures"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var b bytes.Buffer
+			New(&b, Options{Interactive: true, Color: ColorNever}).SummaryDetails(Summary{Status: "COMPLETE", Stats: tt.stats})
+			if !strings.Contains(b.String(), tt.want) {
+				t.Fatalf("missing %q in %s", tt.want, b.String())
+			}
+		})
+	}
+}
+
 func TestSemanticColorSequences(t *testing.T) {
 	t.Setenv("NO_COLOR", "")
 	os.Unsetenv("NO_COLOR")

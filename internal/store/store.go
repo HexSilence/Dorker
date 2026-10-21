@@ -355,6 +355,21 @@ func (s *Store) Stats(ctx context.Context, job string) (model.Stats, error) {
 	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM provider_events WHERE job_id=?`, job).Scan(&st.Errors); err != nil {
 		return st, err
 	}
+	frows, err := s.db.QueryContext(ctx, `SELECT provider,kind,count(*),message FROM provider_events WHERE job_id=? GROUP BY provider,kind,message ORDER BY provider,kind,message`, job)
+	if err != nil {
+		return st, err
+	}
+	for frows.Next() {
+		var f model.ProviderFailure
+		if err = frows.Scan(&f.Provider, &f.Kind, &f.Count, &f.Message); err != nil {
+			frows.Close()
+			return st, err
+		}
+		st.ProviderFailures = append(st.ProviderFailures, f)
+	}
+	if err = frows.Close(); err != nil {
+		return st, err
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT provider,count(*) FROM discoveries WHERE job_id=? GROUP BY provider`, job)
 	if err != nil {
 		return st, err

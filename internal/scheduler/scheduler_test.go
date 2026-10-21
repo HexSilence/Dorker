@@ -1,11 +1,13 @@
 package scheduler
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,6 +21,49 @@ import (
 	"github.com/HexSilence/dorker/internal/store"
 	_ "modernc.org/sqlite"
 )
+
+type transportFailureProvider struct{}
+
+func (transportFailureProvider) Name() string { return "transport" }
+func (transportFailureProvider) Health() provider.HealthStatus {
+	return provider.HealthStatus{State: provider.Ready}
+}
+func (transportFailureProvider) Search(context.Context, provider.SearchRequest) (provider.SearchResponse, error) {
+	return provider.SearchResponse{}, &provider.Error{Kind: provider.KindConnection, Message: "connection refused"}
+}
+
+func TestTransportFailureDebugExplainsMissingHTTPStatus(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "transport.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err = st.CreateJob(ctx, "job", "{}"); err != nil {
+		t.Fatal(err)
+	}
+	variants := []model.QueryVariant{{Original: "q", Variant: "q"}}
+	if err = st.AddVariants(ctx, "job", variants); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	col := &collector.Collector{Store: st, JobID: "job", Normalizer: normalize.New(normalize.Options{})}
+	s := New(st, col, log, Options{Workers: 1, MaxPages: 1, PageSize: 10, Retry: rl.RetryPolicy{MaxAttempts: 1}})
+	if err = s.Run(ctx, "job", variants, []Runtime{NewRuntime(transportFailureProvider{}, 1000, 1)}, nil); err != nil {
+		t.Fatal(err)
+	}
+	text := logs.String()
+	for _, want := range []string{"http_status=0", "response_received=false", "retry_classification=connection_refused", `error="connection refused"`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing %q in %s", want, text)
+		}
+	}
+	stats, err := st.Stats(ctx, "job")
+	if err != nil || len(stats.ProviderFailures) != 1 || stats.ProviderFailures[0].Kind != "connection_refused" {
+		t.Fatalf("stats=%+v err=%v", stats.ProviderFailures, err)
+	}
+}
 
 type provenanceBreakingProvider struct{}
 

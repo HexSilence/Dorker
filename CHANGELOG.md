@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Added specific provider transport classifications and actionable failure summaries.
+- Hardened CLI validation for resume, provider-specific SearXNG options, limits, and nested help.
+- Corrected SearXNG coverage handling for healthy empty responses and pagination completion.
+
 ## v1.0.1
 
 - Added the confirmation-based `dorker update` stable-release workflow.

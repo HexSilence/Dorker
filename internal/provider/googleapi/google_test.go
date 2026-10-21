@@ -63,8 +63,8 @@ func TestErrorsTimeoutCancellationAndRedaction(t *testing.T) {
 		{"forbidden", 403, `{}`, provider.KindUnauthorized},
 		{"quota", 403, `{"error":"daily quota exceeded"}`, provider.KindQuota},
 		{"rate", 429, `{}`, provider.KindRateLimited},
-		{"server", 500, `{}`, provider.KindTemporary},
-		{"unavailable", 503, `{}`, provider.KindTemporary},
+		{"server", 500, `{}`, provider.KindServer},
+		{"unavailable", 503, `{}`, provider.KindServer},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -88,7 +88,7 @@ func TestErrorsTimeoutCancellationAndRedaction(t *testing.T) {
 	malformed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("{")) }))
 	defer malformed.Close()
 	_, err := New(malformed.Client(), "key", "cse", malformed.URL, 4096).Search(context.Background(), provider.SearchRequest{Query: "q"})
-	if provider.KindOf(err) != provider.KindTemporary {
+	if provider.KindOf(err) != provider.KindMalformed {
 		t.Fatalf("malformed: %v", err)
 	}
 	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() }))

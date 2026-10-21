@@ -229,7 +229,7 @@ Recovery:
 Display:
   --quiet                     Hide banner, progress, and info messages.
   --no-banner                 Hide the banner.
-  --log-level LEVEL           Log level: debug, info, warn, or error.
+  --log-level LEVEL           Log level: debug, info, warn, error, or off.
   --dry-run                   Show the plan without making requests or writes.
   --db FILE                   Use a different SQLite database.
   --config FILE               Use a different config file (default %s).
@@ -500,9 +500,9 @@ func statusColor(status string) string {
 	switch strings.ToUpper(status) {
 	case "READY", "COMPLETE", "MATCH", "RESPONSIVE":
 		return green
-	case "FAILED", "UNAVAILABLE", "UNHEALTHY", "MISMATCH", "ACCESS_DENIED", "UNAUTHORIZED":
+	case "FAILED", "UNAVAILABLE", "UNHEALTHY", "MISMATCH", "ACCESS_DENIED", "UNAUTHORIZED", "TLS_ERROR", "MALFORMED_RESPONSE", "CONFIGURATION_ERROR":
 		return red
-	case "DEGRADED", "COMPLETE_DEGRADED", "SATURATED", "COOLDOWN", "RATE_LIMITED", "QUOTA_EXHAUSTED", "PARTIAL", "INTERRUPTED", "BUSY", "UNKNOWN", "CHALLENGE", "TIMEOUT", "NETWORK_ERROR", "SERVER_ERROR":
+	case "DEGRADED", "COMPLETE_DEGRADED", "SATURATED", "COOLDOWN", "RATE_LIMITED", "QUOTA_EXHAUSTED", "PARTIAL", "INTERRUPTED", "BUSY", "UNKNOWN", "CHALLENGE", "TIMEOUT", "NETWORK_ERROR", "DNS_ERROR", "CONNECTION_REFUSED", "SERVER_ERROR":
 		return yellow
 	default:
 		return dim
@@ -562,6 +562,16 @@ func (r *Renderer) SummaryDetails(x Summary) {
 	if x.Stats.Errors > 0 {
 		fmt.Fprintf(r.w, "  %s %s\n", r.Muted(fmt.Sprintf("%-12s", "Errors")), r.paint(red, fmt.Sprint(x.Stats.Errors)))
 	}
+	if len(x.Stats.ProviderFailures) > 0 {
+		fmt.Fprintln(r.w, "\n"+r.heading("Provider failures"))
+		for _, failure := range x.Stats.ProviderFailures {
+			message := failure.Message
+			if message == "" {
+				message = HumanStatus(failure.Kind)
+			}
+			fmt.Fprintf(r.w, "  %-12s %s · %s\n", failure.Provider, r.status(failure.Kind), message)
+		}
+	}
 	if x.SaturationReason != "" {
 		fmt.Fprintf(r.w, "\n%s\n  %s\n", r.heading("Stopped because"), HumanStatus(x.SaturationReason))
 	}
@@ -584,7 +594,12 @@ func (r *Renderer) SummaryDetails(x Summary) {
 		fmt.Fprintf(r.w, "\n%s\n  %s\n", r.heading("Saved"), r.Command(x.Output))
 	}
 	if x.Stats.Unique == 0 {
-		fmt.Fprintln(r.w, "\nNo results found.")
+		switch {
+		case x.Stats.Raw > 0 && x.Stats.Rejected > 0 && x.Stats.Accepted == 0:
+			fmt.Fprintln(r.w, "\nNo usable results; all provider results were rejected by validation.")
+		case x.Stats.Errors == 0:
+			fmt.Fprintln(r.w, "\nNo results found.")
+		}
 	}
 	fmt.Fprintln(r.w)
 }

@@ -47,7 +47,7 @@ func TestErrorsEmptyCancellationAndRedaction(t *testing.T) {
 		name   string
 		status int
 		kind   provider.ErrorKind
-	}{{"bad", 400, provider.KindInvalidQuery}, {"auth", 401, provider.KindUnauthorized}, {"forbidden", 403, provider.KindUnauthorized}, {"unprocessable", 422, provider.KindInvalidQuery}, {"rate", 429, provider.KindRateLimited}, {"server", 500, provider.KindTemporary}, {"unavailable", 503, provider.KindTemporary}} {
+	}{{"bad", 400, provider.KindInvalidQuery}, {"auth", 401, provider.KindUnauthorized}, {"forbidden", 403, provider.KindUnauthorized}, {"unprocessable", 422, provider.KindInvalidQuery}, {"rate", 429, provider.KindRateLimited}, {"server", 500, provider.KindServer}, {"unavailable", 503, provider.KindServer}} {
 		t.Run(tt.name, func(t *testing.T) {
 			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				if tt.status == 429 {
@@ -74,7 +74,7 @@ func TestErrorsEmptyCancellationAndRedaction(t *testing.T) {
 			if name == "empty" && (err != nil || !r.Done) {
 				t.Fatalf("%+v %v", r, err)
 			}
-			if name == "malformed" && provider.KindOf(err) != provider.KindTemporary {
+			if name == "malformed" && provider.KindOf(err) != provider.KindMalformed {
 				t.Fatalf("%v", err)
 			}
 		})

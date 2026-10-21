@@ -135,7 +135,7 @@ func TestHTTPAndMalformedResponses(t *testing.T) {
 		body, ct string
 		kind     provider.ErrorKind
 		message  string
-	}{{"400", 400, "bad", "application/json", provider.KindInvalidQuery, ""}, {"401", 401, "no", "application/json", provider.KindUnauthorized, ""}, {"403", 403, "no", "application/json", provider.KindUnauthorized, "JSON search API unavailable"}, {"404", 404, "no", "application/json", provider.KindInvalidQuery, ""}, {"429", 429, "slow", "application/json", provider.KindRateLimited, ""}, {"500", 500, "oops", "application/json", provider.KindTemporary, ""}, {"502", 502, "oops", "application/json", provider.KindTemporary, ""}, {"503", 503, "oops", "application/json", provider.KindTemporary, ""}, {"json", 200, "{", "application/json", provider.KindTemporary, "decode JSON"}, {"html", 200, "<html>login</html>", "text/html", provider.KindUnauthorized, "expected JSON"}}
+	}{{"400", 400, "bad", "application/json", provider.KindInvalidQuery, ""}, {"401", 401, "no", "application/json", provider.KindUnauthorized, ""}, {"403", 403, "no", "application/json", provider.KindUnauthorized, "JSON search API unavailable"}, {"404", 404, "no", "application/json", provider.KindInvalidQuery, ""}, {"429", 429, "slow", "application/json", provider.KindRateLimited, ""}, {"500", 500, "oops", "application/json", provider.KindServer, ""}, {"502", 502, "oops", "application/json", provider.KindServer, ""}, {"503", 503, "oops", "application/json", provider.KindServer, ""}, {"json", 200, "{", "application/json", provider.KindMalformed, "decode JSON"}, {"html", 200, "<html>login</html>", "text/html", provider.KindUnauthorized, "expected JSON"}}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			c, s := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -172,7 +172,7 @@ func TestTimeoutCancellationAndOversize(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, err = c.Search(context.Background(), provider.SearchRequest{Query: "x"})
-		if provider.KindOf(err) != provider.KindTemporary {
+		if provider.KindOf(err) != provider.KindTimeout {
 			t.Fatal(err)
 		}
 	})
@@ -302,5 +302,30 @@ func TestClusterBalancedAndCoverage(t *testing.T) {
 	out, err := cov.Search(context.Background(), provider.SearchRequest{Query: "x"})
 	if err != nil || len(out.Results) != 2 {
 		t.Fatalf("%+v %v", out, err)
+	}
+}
+
+func TestClusterCoverageAcceptsHealthyEmptyResponses(t *testing.T) {
+	a, as := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"results":[]}`)
+	}), nil)
+	defer as.Close()
+	b, bs := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"results":[]}`)
+	}), func(o *Options) { o.Name = "secondary" })
+	defer bs.Close()
+	cluster, _ := NewCluster([]*Client{a, b}, "coverage")
+	out, err := cluster.Search(context.Background(), provider.SearchRequest{Query: "x"})
+	if err != nil || len(out.Results) != 0 || !out.Done {
+		t.Fatalf("out=%+v err=%v", out, err)
+	}
+}
+
+func TestCleanNormalizesAndDeduplicatesValues(t *testing.T) {
+	got := clean([]string{" DuckDuckGo ", "duckduckgo", "YAHOO", ""})
+	if fmt.Sprint(got) != "[duckduckgo yahoo]" {
+		t.Fatalf("got %v", got)
 	}
 }

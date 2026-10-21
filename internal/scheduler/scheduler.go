@@ -223,7 +223,8 @@ func (s *Scheduler) runTask(ctx context.Context, job string, t task) error {
 		resp, err := t.rt.Provider.Search(ctx, req)
 		if err != nil {
 			s.record(ErrorPage)
-			s.Log.Debug("provider response", "provider", p.Provider, "duration", time.Since(started), "http_status", responseStatus(err), "page", p.Page, "cursor", p.Cursor, "results", 0, "retry_classification", provider.KindOf(err))
+			status := responseStatus(err)
+			s.Log.Debug("provider response", "provider", p.Provider, "duration", time.Since(started), "http_status", status, "response_received", status != 0, "page", p.Page, "cursor", p.Cursor, "results", 0, "retry_classification", provider.KindOf(err), "error", err.Error())
 			p.Attempts++
 			p.LastError = err.Error()
 			kind := provider.KindOf(err)
@@ -244,7 +245,11 @@ func (s *Scheduler) runTask(ctx context.Context, job string, t task) error {
 				s.report.Partial = true
 				s.report.ProviderFailures++
 				s.reportMu.Unlock()
-				_ = s.Store.Event(ctx, job, p.Provider, "failure", err.Error())
+				eventKind := string(kind)
+				if eventKind == "" {
+					eventKind = "failure"
+				}
+				_ = s.Store.Event(ctx, job, p.Provider, eventKind, err.Error())
 				if e := s.Store.SaveProgress(ctx, p); e != nil {
 					return e
 				}

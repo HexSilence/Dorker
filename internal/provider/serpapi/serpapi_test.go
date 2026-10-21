@@ -64,7 +64,7 @@ func TestProviderErrorsHTTPTimeoutCancellationAndRedaction(t *testing.T) {
 			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(status) }))
 			defer s.Close()
 			_, err := New(s.Client(), "key", s.URL, 4096).Search(context.Background(), provider.SearchRequest{Query: "q"})
-			want := provider.KindTemporary
+			want := provider.KindServer
 			if status == 429 {
 				want = provider.KindRateLimited
 			}
@@ -76,7 +76,7 @@ func TestProviderErrorsHTTPTimeoutCancellationAndRedaction(t *testing.T) {
 	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("{")) }))
 	defer bad.Close()
 	_, err := New(bad.Client(), "key", bad.URL, 4096).Search(context.Background(), provider.SearchRequest{Query: "q"})
-	if provider.KindOf(err) != provider.KindTemporary {
+	if provider.KindOf(err) != provider.KindMalformed {
 		t.Fatalf("%v", err)
 	}
 	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() }))

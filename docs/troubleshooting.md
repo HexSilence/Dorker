@@ -34,6 +34,10 @@ Podman is optional. Use a remote/API provider, Docker, or install Podman through
 
 Dorker honors cooldowns and does not bypass provider protections. Wait for the provider limit to recover, verify account/quota status, or select another configured provider. Use `dorker providers test NAME` for one explicit diagnostic request.
 
+## Provider request failed before an HTTP response
+
+An HTTP status of zero in debug output means no HTTP response was received. Dorker reports the transport class separately, such as DNS lookup failure, connection refused, TLS verification failure, timeout, or another network error. Test the selected provider with `dorker providers test NAME`; for local SearXNG, also confirm that its configured loopback endpoint is listening. Provider URLs and credentials are not printed in failure summaries.
+
 ## Configuration invalid
 
 Run `dorker config check`. Unknown YAML fields, unsupported enum values, invalid URLs, and missing required provider fields are reported without printing secrets.

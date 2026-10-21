@@ -92,8 +92,13 @@ func sameOrigin(a, b *url.URL) bool {
 }
 func clean(in []string) []string {
 	out := make([]string, 0, len(in))
+	seen := make(map[string]struct{}, len(in))
 	for _, v := range in {
-		if v = strings.TrimSpace(v); v != "" {
+		if v = strings.ToLower(strings.TrimSpace(v)); v != "" {
+			if _, ok := seen[v]; ok {
+				continue
+			}
+			seen[v] = struct{}{}
 			out = append(out, v)
 		}
 	}
@@ -150,7 +155,7 @@ func (c *Client) Search(ctx context.Context, r provider.SearchRequest) (out prov
 	}
 	resp, e := c.client.Do(req)
 	if e != nil {
-		return out, &provider.Error{Kind: provider.KindTemporary, Message: "request canceled or timed out", Cause: e}
+		return out, provider.TransportError("SearXNG request", e)
 	}
 	out.HTTPStatus = resp.StatusCode
 	if resp.StatusCode == 403 {
@@ -273,6 +278,8 @@ func (c *Cluster) Search(ctx context.Context, r provider.SearchRequest) (provide
 	start := int(c.next.Add(1)-1) % len(c.instances)
 	var combined provider.SearchResponse
 	var first error
+	successes := 0
+	allDone := true
 	hasReady := false
 	for _, candidate := range c.instances {
 		state := candidate.Health().State
@@ -302,18 +309,19 @@ func (c *Cluster) Search(ctx context.Context, r provider.SearchRequest) (provide
 			out.PartialErrors = append(out.PartialErrors, combined.PartialErrors...)
 			return out, nil
 		}
+		successes++
 		combined.Results = append(combined.Results, out.Results...)
 		combined.Diagnostics = append(combined.Diagnostics, out.Diagnostics...)
 		combined.HTTPStatus = out.HTTPStatus
 		combined.Duration += out.Duration
-		combined.Done = combined.Done || out.Done
+		allDone = allDone && out.Done
 	}
-	if c.strategy == "coverage" && len(combined.Results) > 0 {
-		combined.Done = false
+	if c.strategy == "coverage" && successes > 0 {
+		combined.Done = allDone
 		return combined, nil
 	}
 	if first != nil {
 		return combined, first
 	}
-	return combined, &provider.Error{Provider: "searxng", Kind: provider.KindTemporary, Message: "all instances are in cooldown"}
+	return combined, &provider.Error{Provider: "searxng", Kind: provider.KindUnavailable, Message: "all instances are unavailable or in cooldown"}
 }

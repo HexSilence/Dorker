@@ -17,10 +17,10 @@ func DecodeJSONResponse(resp *http.Response, max int64, dst any) error {
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, max+1))
 	if err != nil {
-		return &Error{Kind: KindTemporary, Message: "read response", Cause: err}
+		return TransportError("read response", err)
 	}
 	if int64(len(body)) > max {
-		return &Error{Kind: KindTemporary, Message: "response exceeds size limit"}
+		return &Error{Kind: KindMalformed, Message: "response exceeds size limit"}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return classifyHTTP(resp, body)
@@ -34,7 +34,7 @@ func DecodeJSONResponse(resp *http.Response, max int64, dst any) error {
 		return &Error{Kind: KindUnauthorized, Message: "expected JSON search response but received HTML"}
 	}
 	if err := json.Unmarshal(body, dst); err != nil {
-		return &Error{Kind: KindTemporary, Message: "decode JSON response", Cause: err}
+		return &Error{Kind: KindMalformed, Message: "decode JSON response", Cause: err}
 	}
 	return nil
 }
@@ -58,7 +58,7 @@ func classifyHTTP(resp *http.Response, body []byte) error {
 		base.Kind, base.Message = KindInvalidQuery, fmt.Sprintf("invalid request (HTTP %d)", resp.StatusCode)
 	default:
 		if resp.StatusCode >= 500 {
-			base.Kind, base.Message, base.RetryAfter = KindTemporary, fmt.Sprintf("temporary provider failure (HTTP %d)", resp.StatusCode), retryAfter(resp)
+			base.Kind, base.Message, base.RetryAfter = KindServer, fmt.Sprintf("provider server error (HTTP %d)", resp.StatusCode), retryAfter(resp)
 			return base
 		}
 		base.Kind, base.Message = KindTemporary, fmt.Sprintf("unexpected provider response (HTTP %d)", resp.StatusCode)

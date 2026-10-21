@@ -2,7 +2,6 @@ package googleapi
 
 import (
 	"context"
-	"errors"
 	"github.com/HexSilence/dorker/internal/model"
 	"github.com/HexSilence/dorker/internal/provider"
 	"net/http"
@@ -81,10 +80,7 @@ func (c *Client) Search(ctx context.Context, r provider.SearchRequest) (out prov
 	}
 	resp, e := c.client.Do(req)
 	if e != nil {
-		if errors.Is(e, context.Canceled) || errors.Is(e, context.DeadlineExceeded) {
-			return out, &provider.Error{Kind: provider.KindTemporary, Message: "request canceled or timed out", Cause: e}
-		}
-		return out, &provider.Error{Kind: provider.KindTemporary, Message: "request failed", Cause: e}
+		return out, provider.TransportError("Google API request", e)
 	}
 	out.HTTPStatus = resp.StatusCode
 	var payload struct {

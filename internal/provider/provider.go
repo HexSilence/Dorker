@@ -2,9 +2,15 @@ package provider
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
+	"os"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/HexSilence/dorker/internal/model"
@@ -27,12 +33,21 @@ const (
 type ErrorKind string
 
 const (
-	KindRateLimited  ErrorKind = "rate_limited"
-	KindQuota        ErrorKind = "quota_exhausted"
-	KindChallenge    ErrorKind = "challenge"
-	KindUnauthorized ErrorKind = "unauthorized"
-	KindTemporary    ErrorKind = "temporary"
-	KindInvalidQuery ErrorKind = "invalid_query"
+	KindRateLimited   ErrorKind = "rate_limited"
+	KindQuota         ErrorKind = "quota_exhausted"
+	KindChallenge     ErrorKind = "challenge"
+	KindUnauthorized  ErrorKind = "unauthorized"
+	KindTemporary     ErrorKind = "temporary"
+	KindInvalidQuery  ErrorKind = "invalid_query"
+	KindNetwork       ErrorKind = "network_error"
+	KindDNS           ErrorKind = "dns_error"
+	KindTLS           ErrorKind = "tls_error"
+	KindTimeout       ErrorKind = "timeout"
+	KindConnection    ErrorKind = "connection_refused"
+	KindServer        ErrorKind = "server_error"
+	KindMalformed     ErrorKind = "malformed_response"
+	KindUnavailable   ErrorKind = "unavailable"
+	KindConfiguration ErrorKind = "configuration_error"
 )
 
 type Error struct {
@@ -64,7 +79,55 @@ func KindOf(err error) ErrorKind {
 }
 func Retryable(err error) bool {
 	k := KindOf(err)
-	return k == KindRateLimited || k == KindTemporary || k == KindChallenge
+	return k == KindRateLimited || k == KindTemporary || k == KindChallenge || k == KindNetwork || k == KindDNS || k == KindTimeout || k == KindConnection || k == KindServer
+}
+
+// TransportError preserves a useful, non-secret classification for failures
+// that happen before an HTTP response exists. Such failures legitimately have
+// no HTTP status code.
+func TransportError(message string, err error) error {
+	kind := KindNetwork
+	detail := "network request failed"
+	var dns *net.DNSError
+	var unknownAuthority x509.UnknownAuthorityError
+	var hostnameError x509.HostnameError
+	var certificateInvalid x509.CertificateInvalidError
+	var recordHeader tls.RecordHeaderError
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		kind, detail = KindTimeout, "request timed out"
+	case errors.Is(err, context.Canceled):
+		kind, detail = KindTemporary, "request canceled"
+	case errors.As(err, &dns):
+		kind, detail = KindDNS, "DNS lookup failed"
+	case errors.As(err, &unknownAuthority) || errors.As(err, &hostnameError) || errors.As(err, &certificateInvalid) || errors.As(err, &recordHeader):
+		kind, detail = KindTLS, "TLS certificate verification failed"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		kind, detail = KindConnection, "connection refused"
+	default:
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			kind, detail = KindTimeout, "request timed out"
+		} else {
+			var urlErr *url.Error
+			if errors.As(err, &urlErr) && urlErr.Err != nil && urlErr.Err != err {
+				classified := TransportError(message, urlErr.Err)
+				var pe *Error
+				if errors.As(classified, &pe) {
+					pe.Cause = err
+					return pe
+				}
+			}
+			var pathErr *os.SyscallError
+			if errors.As(err, &pathErr) && errors.Is(pathErr.Err, syscall.ECONNREFUSED) {
+				kind, detail = KindConnection, "connection refused"
+			}
+		}
+	}
+	if message != "" {
+		detail = message + ": " + detail
+	}
+	return &Error{Kind: kind, Message: detail, Cause: err}
 }
 func RetryDelay(err error) time.Duration {
 	var e *Error
@@ -84,7 +147,12 @@ func WithProvider(name string, err error) error {
 		copy.Provider = name
 		return &copy
 	}
-	return &Error{Provider: name, Kind: KindTemporary, Message: "request failed", Cause: err}
+	classified := TransportError("request", err)
+	var classifiedError *Error
+	if errors.As(classified, &classifiedError) {
+		classifiedError.Provider = name
+	}
+	return classified
 }
 
 type SearchRequest struct {
@@ -202,7 +270,7 @@ func (t *HealthTracker) Start() func(error) {
 			}
 		case KindQuota:
 			t.h.State = QuotaExhausted
-		case KindTemporary:
+		case KindTemporary, KindNetwork, KindDNS, KindTLS, KindTimeout, KindConnection, KindServer, KindMalformed:
 			t.h.TemporaryFailures++
 			t.h.State = Degraded
 		case KindUnauthorized:
