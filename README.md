@@ -1,84 +1,145 @@
 # Dorker
 
-Dorker is a cross-platform search and passive reconnaissance CLI for authorized security research. It queries documented search APIs, enforces local scope, normalizes and deduplicates URLs, records provenance in SQLite, and produces reusable output.
+[![Latest Release](https://img.shields.io/github/v/release/HexSilence/Dorker?display_name=tag)](https://github.com/HexSilence/Dorker/releases/latest)
+[![Test](https://github.com/HexSilence/Dorker/actions/workflows/test.yml/badge.svg)](https://github.com/HexSilence/Dorker/actions/workflows/test.yml)
+[![Build](https://github.com/HexSilence/Dorker/actions/workflows/build.yml/badge.svg)](https://github.com/HexSilence/Dorker/actions/workflows/build.yml)
+[![Go 1.24+](https://img.shields.io/badge/Go-1.24%2B-00ADD8?logo=go)](https://go.dev/)
+[![License](https://img.shields.io/github/license/HexSilence/Dorker)](LICENSE)
 
-Built by Silence.
+Dorker is a cross-platform Go CLI for structured multi-provider search, Google-dork-style query workflows, result validation, persistent collection, and bounded host discovery. It is designed for authorized security research and other legitimate public-web research.
 
-## Key features
+Built by **Silence**. Original-project attribution: **HexSilence**.
 
-- SearXNG, Brave Search, Google Custom Search, and SerpAPI providers
-- Bounded retries, provider cooldowns, health reporting, and resumable jobs
-- Mandatory `site:` boundary enforcement, even when optional validation is off
-- Persistent recursive discovery frontier with leases and safe resume
-- Trustworthy/degraded discovery coverage and terminal-evidence reporting
-- Local GHDB catalog, URL normalization, and provenance-aware deduplication
-- TXT, JSONL, and CSV exports with `none`, `host`, and `domain` collapse modes
-- Automatic output for interactive runs; data-only stdout for redirects and pipelines
-- Pure-Go SQLite: CGO is not required
+**Latest stable: v1.0.1**
+
+## Features
+
+- Aggregates Google Custom Search JSON API, Brave Search API, SerpAPI's Google engine, and self-hosted or user-configured SearXNG.
+- Plans exact or conservative Google-dork-style queries while retaining provider provenance.
+- Enforces positive and negative `site:` scope locally after URL normalization, preventing out-of-scope results from reaching persistence or exports.
+- Locally evaluates `site:`, `-site:`, `ext:`, `filetype:`, `-ext:`, `-filetype:`, `inurl:`, and `-inurl:` where conclusive.
+- Normalizes URLs, removes common tracking parameters, deduplicates results, and stores canonical data in pure-Go SQLite.
+- Preserves provider, instance, source-engine, query-variant, discovery-edge, and repeated-source provenance.
+- Supports checkpoints, resumable searches, persistent discovery frontiers, crash recovery, and job leases.
+- Honors provider rate limits, `Retry-After`, exponential backoff with jitter, cooldowns, health state, and bounded adaptive scheduling.
+- Exports TXT, JSONL, and CSV; supports host/domain collapse and clean redirected stdout.
+- Includes a local structured GHDB catalog, provider diagnostics, `doctor`, safe first-run configuration, and managed SearXNG setup.
+- Recursively discovers in-scope hosts with hard limits, public-suffix-aware roots, per-depth gain, degradation-aware saturation, and deterministic artifacts.
+- Provides the first built-in `dorker update` workflow and cached awareness of future stable releases.
+- Supports Linux amd64/arm64, macOS amd64/arm64, and Windows amd64.
 
 ## Installation
 
-Dorker requires Go 1.24 or newer. After the public `v1.0.0` tag is available:
+Dorker requires Go 1.24 or newer. Pin the current stable release for a reproducible installation:
 
 ```sh
-go install github.com/HexSilence/dorker/cmd/dorker@v1.0.0
+go install github.com/HexSilence/dorker/cmd/dorker@v1.0.1
 ```
 
-Go installs commands to `GOBIN`, or to `GOPATH/bin` when `GOBIN` is unset. That directory must be on your `PATH`; Go and Dorker do not modify shell configuration automatically. See [docs/installation.md](docs/installation.md).
+Or ask Go for the latest published module version:
+
+```sh
+go install github.com/HexSilence/dorker/cmd/dorker@latest
+```
+
+`@v1.0.1` always selects this exact release. `@latest` selects the newest semantic module version visible to Go. The executable is installed to `GOBIN`, or `GOPATH/bin` when `GOBIN` is unset; that directory must be on `PATH`.
+
+Platform-specific installation details are in [docs/installation.md](docs/installation.md).
 
 ## Quick start
 
 ```sh
 dorker
-dorker doctor
 dorker setup
+dorker doctor
+dorker providers
 dorker search -q 'site:example.com'
+dorker search -q 'site:example.com filetype:pdf'
 dorker discover -q 'site:example.com'
+dorker ghdb
+dorker update
 ```
 
-Running `dorker` for the first time creates a minimal user config without overwriting an existing file, then shows a short onboarding screen. It does not install system packages or start containers.
+The first plain invocation atomically creates a default user config if none exists and displays onboarding. It does not install packages or start containers.
 
-## First-time setup
+## Updates
 
-`dorker doctor` reports the version, OS/architecture, resolved config/database/output paths, optional container runtimes, and provider readiness without printing credentials. `dorker setup` safely creates a config if needed and explains provider choices.
+```sh
+dorker version
+dorker update
+```
 
-For a local backend:
+`dorker update` performs one workflow: it retrieves the latest published stable Dorker release, compares versions, and reports when the installation is current. When a newer release exists, Dorker requests interactive confirmation before changing a recognized Go installation.
+
+For an unknown installation method—or on Windows, where replacing a running executable is unsafe—Dorker prints an exact validated `go install ...@vVERSION` command instead of guessing or overwriting the executable. Dorker does not perform unchecked release-binary replacement.
+
+Starting with v1.0.1, interactive commands may display one concise future-release notice. Passive metadata is cached for approximately 24 hours and failures never affect normal commands. Disable passive checks with:
+
+```yaml
+update_check:
+  enabled: false
+```
+
+or `DORKER_NO_UPDATE_CHECK=1`. This does not disable an explicit `dorker update` request.
+
+The immutable v1.0.0 release predates built-in update awareness. Existing v1.0.0 users can install v1.0.1 with the pinned command in [Installation](#installation).
+
+## SearXNG
+
+Preview managed local setup, then explicitly apply it:
 
 ```sh
 dorker setup searxng
 dorker setup searxng --yes
 ```
 
-The first command previews the container action; `--yes` explicitly approves it.
+Setup prefers Podman and falls back to Docker. It creates or starts the digest-pinned `dorker-searxng` container, binds only `http://127.0.0.1:8080`, waits for a valid JSON response, and updates Dorker's config only after readiness succeeds. Compatible legacy containers are reused safely; unrelated or incompatible containers are not replaced. Repeated setup does not duplicate the local instance and preserves user-managed instances.
 
-## Search examples
+An existing SearXNG service can instead be supplied through `SEARXNG_URL` or configured instances. Dorker respects upstream rate limits and restrictions; it does not provide CAPTCHA or restriction bypasses.
+
+## Providers
+
+| Provider | Configuration | Diagnostic command |
+|---|---|---|
+| SearXNG | `SEARXNG_URL` or configured instances; optional token environment variable | `dorker providers test searxng` |
+| Brave Search API | `BRAVE_API_KEY` | `dorker providers test brave` |
+| Google Custom Search JSON API | `GOOGLE_API_KEY`, `GOOGLE_CSE_ID` | `dorker providers test google-api` |
+| SerpAPI Google engine | `SERPAPI_API_KEY`; enable in config | `dorker providers test serpapi` |
+
+The mock provider is reserved for deterministic development and testing. API-backed providers require credentials from the user; Dorker does not bundle or print credentials.
+
+## Queries and validation
 
 ```sh
 dorker search -q 'site:example.com'
 dorker search -q 'site:example.com ext:pdf'
-dorker search -f queries.txt
-dorker search -q 'site:example.com' --collapse host
-dorker search -q 'site:example.com' --format jsonl -o results.jsonl
-cat queries.txt | dorker search
-dorker search -q 'site:example.com' | httpx
+dorker query explain 'site:example.com -site:dev.example.com filetype:pdf'
+dorker query validate -q 'site:example.com ext:pdf' -u 'https://docs.example.com/report.pdf'
 ```
 
-Local validation never requests discovered URLs. A positive `site:` boundary is always enforced after normalization; `--validation off` disables optional checks, not scope protection.
+Hostname matching is DNS-label aware. A result under `example.com.attacker.test`, or merely containing `example.com` in its path/query, does not satisfy `site:example.com`. Mandatory positive-site scope remains fail-closed in every validation mode. `off`, `conservative`, and `strict` control optional locally enforceable checks; they do not weaken site scope. Provider-only operators remain provider-side rather than being falsely rejected locally.
 
-## Discovery examples
+## Discovery
+
+```text
+seed query -> validated URLs -> normalized hosts -> bounded frontier
+           -> host expansion -> validation/deduplication/provenance
+           -> per-depth gain -> saturation or hard limit
+```
 
 ```sh
 dorker discover -q 'site:example.com'
+dorker discover -q 'site:example.com' --max-depth 3
 dorker discover -q 'site:example.com' --max-depth 3 --max-hosts 5000
 dorker discover -q 'site:example.com' --hosts-only | sort -u
-dorker discover -q 'site:example.com' --roots-only > roots.txt
+dorker resume <job-id>
 ```
 
-Discovery recursively searches accepted in-scope hosts. Its frontier, completed work, depth statistics, limits, provenance, and output-directory ownership persist for resume. Rate limits, challenges, timeouts, and unavailable sources do not count as saturation evidence. If the frontier empties while coverage remains degraded, the stop reason is `FRONTIER_EXHAUSTED_DEGRADED` and the run remains partial.
-
-See [docs/discovery.md](docs/discovery.md) for coverage, historical degradation, terminal evidence, leases, resume, and artifact semantics.
+Important limits include `--max-depth`, `--max-hosts`, `--max-queries`, `--max-results`, `--max-results-per-query`, `--max-pages`, and `--max-duration`. Saturation requires trustworthy provider coverage; degraded or failed providers are not mistaken for evidence of exhaustion. See [docs/discovery.md](docs/discovery.md).
 
 ## GHDB
+
+Dorker contains a local structured catalog; it does not fetch an external GHDB at runtime.
 
 ```sh
 dorker ghdb
@@ -88,84 +149,58 @@ dorker ghdb find login
 dorker ghdb run 5 --domain example.com
 ```
 
-GHDB is bundled in the binary; no source-tree files are needed at runtime. Searches use the same provider, scope, persistence, collapse, and export pipeline. See [docs/ghdb.md](docs/ghdb.md).
+GHDB execution uses the normal provider, validation, persistence, and export pipeline. See [docs/ghdb.md](docs/ghdb.md).
 
-## Providers
+## Output and persistence
 
-| Provider | Configuration | Test command |
-|---|---|---|
-| SearXNG | instance URL; optional token environment variable | `dorker providers test searxng` |
-| Brave Search | `BRAVE_API_KEY` | `dorker providers test brave` |
-| Google Custom Search | `GOOGLE_API_KEY` and `GOOGLE_CSE_ID` | `dorker providers test google-api` |
-| SerpAPI | `SERPAPI_API_KEY`; enable it in config | `dorker providers test serpapi` |
+Interactive non-empty searches save beneath the configured output root (normally `~/dorker-output`). Redirected or piped stdout contains result data only; progress and diagnostics stay on stderr and no extra automatic result file is created. Explicit `-o` wins.
 
-`dorker providers` is an offline status view. `providers test` makes one small explicit request. Details are in [docs/providers.md](docs/providers.md).
-
-## SearXNG
-
-Dorker can use an external SearXNG JSON API through `SEARXNG_URL` or configured instances. Guided local setup prefers Podman, falls back to Docker, binds only `127.0.0.1:8080`, generates a private settings secret, waits for valid JSON, and changes Dorker config only after readiness succeeds. Setup is idempotent: it reuses an existing compatible `dorker-searxng` container, starting it when stopped, without recreating it.
-
-The image is digest-pinned. Setup will not install a runtime, use sudo/admin access, replace an unrelated container, or remount an existing compatible Dorker container.
-
-## Output
-
-Interactive searches automatically save non-empty output below the configured output root. Discovery saves `urls.txt`, `hosts.txt`, `roots.txt`, and `discovery.json`. Existing automatic files and discovery directories are not overwritten; resumed discovery reuses only its persisted owned directory.
-
-Explicit `-o` wins. Redirected or piped searches emit data to stdout and do not create an extra automatic output file. Progress, summaries, and diagnostics go to stderr.
-
-## Resume and jobs
-
-```sh
-dorker jobs
-dorker resume <job-id>
-dorker stats <job-id>
-dorker export <job-id> --format jsonl -o results.jsonl
-```
-
-Job leases prevent two active processes from owning the same work. Search resume preserves provider progress; discovery resume additionally restores its frontier and output ownership.
+Search supports TXT, JSONL, CSV, and `none`, `host`, or `domain` collapse. Discovery writes `urls.txt`, `hosts.txt`, `roots.txt`, and `discovery.json`. SQLite remains authoritative and retains full canonical URL and provenance data even when presentation output is collapsed.
 
 ## Configuration
 
-```sh
-dorker config
-dorker config init
-dorker config check
-```
+Default config locations:
 
-`DORKER_CONFIG` and `--config` override the default. Credentials remain in environment variables and are never written by bootstrap or printed by diagnostics. See [docs/configuration.md](docs/configuration.md) and [configs/config.example.yaml](configs/config.example.yaml).
+| Platform | Configuration |
+|---|---|
+| Linux | `$XDG_CONFIG_HOME/dorker/config.yaml`, or `~/.config/dorker/config.yaml` |
+| macOS | `~/Library/Application Support/dorker/config.yaml` |
+| Windows | `%AppData%\dorker\config.yaml` |
+
+`DORKER_CONFIG` or command-level `--config` selects another file. Data uses the OS-appropriate application data directory; results default to `~/dorker-output`. Credentials belong in documented environment variables, not YAML. See [docs/configuration.md](docs/configuration.md) and [configs/config.example.yaml](configs/config.example.yaml).
 
 ## Supported platforms
 
-| Platform | Architecture | v1.0.0 status |
+| Platform | Architecture | Validation |
 |---|---|---|
-| Linux | amd64, arm64 | supported |
-| macOS | amd64, arm64 | supported |
-| Windows | amd64 | supported |
+| Linux | amd64, arm64 | cross-build; amd64 CI runtime and race tests |
+| macOS | amd64, arm64 | cross-build; native GitHub-hosted runner |
+| Windows | amd64 | cross-build; native GitHub-hosted runner |
 
-CI is configured for native tests and binary/install smoke tests on Ubuntu, macOS, and Windows. Cross-builds cover all five target pairs. Windows arm64 is not claimed.
+Cross-compilation is not presented as runtime testing. Windows arm64 is not currently claimed.
 
-## Responsible and authorized use
+## Versioning
 
-Use Dorker only where you have authorization. Dorker does not solve CAPTCHAs, evade anti-bot controls, rotate proxies, or bypass provider limits. It honors retry and cooldown signals. See [SECURITY.md](SECURITY.md).
+Current stable: **v1.0.1**.
 
-## Development and building
+Use `dorker version` for local build metadata and `dorker update` for the latest stable release workflow. v1.0.0 remains an immutable historical release and module version; v1.0.1 contains the subsequent stabilization and update work.
+
+## Responsible use
+
+Use Dorker only for targets and data you are authorized to research. It searches public provider indexes and does not perform exploitation, CAPTCHA solving, proxy rotation, or provider-control evasion. See [SECURITY.md](SECURITY.md).
+
+## Development
 
 ```sh
-go mod download
+go mod verify
 go test ./...
 go vet ./...
 go test -race ./...
-go build ./...
+go build ./cmd/dorker
 ```
 
-Source contributors can use `go install ./cmd/dorker`. Normal users do not need a clone. See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-Dorker is licensed under the [Apache License 2.0](LICENSE). The [NOTICE](NOTICE) preserves the original-project attribution:
-
-> Dorker — Original project by HexSilence
->
-> https://github.com/HexSilence/Dorker
-
-Forks and modified distributions must follow the license and preserve applicable notices. Contributors may identify their own modifications; the original-project credit remains HexSilence. The license does not grant permission to use project names or marks to misrepresent a derivative as the original project.
+Dorker is licensed under the [Apache License 2.0](LICENSE). [NOTICE](NOTICE) preserves HexSilence's legal/original-project attribution.

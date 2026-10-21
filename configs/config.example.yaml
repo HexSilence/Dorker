@@ -62,3 +62,6 @@ providers:
     enabled: false
     requests_per_second: 100
     burst: 10
+# Passive future-release awareness. Explicit `dorker update` always works.
+update_check:
+  enabled: true

@@ -31,3 +31,12 @@ discovery:
 ```
 
 Command-line discovery flags override these values. Existing configurations that omit the section receive the built-in defaults.
+
+Passive future-release awareness is enabled by default:
+
+```yaml
+update_check:
+  enabled: true
+```
+
+Interactive commands use cached public GitHub release metadata and may display one concise notice when a future stable release exists. The cache lasts approximately 24 hours. Set `enabled: false` or `DORKER_NO_UPDATE_CHECK=1` to disable passive checks. An explicit `dorker update` request remains available.

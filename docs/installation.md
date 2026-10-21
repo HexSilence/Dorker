@@ -4,11 +4,11 @@ Dorker requires Go 1.24 or newer. Podman or Docker is optional and is needed onl
 
 ## A. Recommended Go installation
 
-After the public `v1.0.0` tag is available:
+Install the current stable `v1.0.1` release:
 
 ```sh
 go version
-go install github.com/HexSilence/dorker/cmd/dorker@v1.0.0
+go install github.com/HexSilence/dorker/cmd/dorker@v1.0.1
 ```
 
 This installs a self-contained command. A repository clone, CGO compiler, config file, and source-tree assets are not required.
@@ -94,10 +94,10 @@ Distribution repositories sometimes carry an older Go release. Check `go version
 
 ## Updating and uninstalling
 
-Update by running the same versioned `go install` command for the desired published release.
+Starting with v1.0.1, run `dorker update`. It checks the latest stable release, requests confirmation before modifying a recognized Go installation, and provides an exact version-pinned command for unsupported installation methods.
 
 To uninstall, resolve `GOBIN`/`GOPATH/bin` and remove only `dorker` (`dorker.exe` on Windows). Config, SQLite state, output, and an optional `dorker-searxng` container are retained.
 
 ## Release validation
 
-Before the tag exists, CI installs the checkout into a temporary `GOBIN`, changes to an unrelated temporary directory, and runs home/help/version/doctor on Linux, macOS, and Windows. After publication, repeat that smoke test with the canonical `@v1.0.0` command above.
+CI installs the checkout into a temporary `GOBIN`, changes to an unrelated temporary directory, and runs home/help/version/doctor on Linux, macOS, and Windows. Release verification repeats that smoke test with the canonical `@v1.0.1` command above.
