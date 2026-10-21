@@ -15,15 +15,19 @@ import (
 )
 
 type Config struct {
-	Database   DatabaseConfig            `yaml:"database"`
-	Scheduler  SchedulerConfig           `yaml:"scheduler"`
-	Retry      RetryConfig               `yaml:"retry"`
-	HTTP       HTTPConfig                `yaml:"http"`
-	Providers  map[string]ProviderConfig `yaml:"providers"`
-	Validation ValidationConfig          `yaml:"validation"`
-	Output     OutputConfig              `yaml:"output"`
-	UI         UIConfig                  `yaml:"ui"`
-	Discovery  DiscoveryConfig           `yaml:"discovery"`
+	Database    DatabaseConfig            `yaml:"database"`
+	Scheduler   SchedulerConfig           `yaml:"scheduler"`
+	Retry       RetryConfig               `yaml:"retry"`
+	HTTP        HTTPConfig                `yaml:"http"`
+	Providers   map[string]ProviderConfig `yaml:"providers"`
+	Validation  ValidationConfig          `yaml:"validation"`
+	Output      OutputConfig              `yaml:"output"`
+	UI          UIConfig                  `yaml:"ui"`
+	Discovery   DiscoveryConfig           `yaml:"discovery"`
+	UpdateCheck UpdateCheckConfig         `yaml:"update_check"`
+}
+type UpdateCheckConfig struct {
+	Enabled bool `yaml:"enabled"`
 }
 type DiscoveryConfig struct {
 	MaxDepth                    int           `yaml:"max_depth"`
@@ -93,14 +97,15 @@ type SearXNGInstanceConfig struct {
 
 func Default() Config {
 	return Config{
-		Database:   DatabaseConfig{Path: defaultDatabasePath()},
-		Scheduler:  SchedulerConfig{Workers: 5, Saturation: SaturationConfig{Enabled: true, ConsecutiveZeroYieldPages: 2}, Recovery: RecoveryConfig{MaxWait: 2 * time.Minute}},
-		Retry:      RetryConfig{MaxAttempts: 4, BaseDelay: 2 * time.Second, MaxDelay: 2 * time.Minute, Jitter: true},
-		HTTP:       HTTPConfig{RequestTimeout: 20 * time.Second, ConnectTimeout: 5 * time.Second, MaxBodyBytes: 4 << 20},
-		Validation: ValidationConfig{Mode: "conservative"},
-		Output:     OutputConfig{Collapse: "none", Directory: defaultOutputPath()},
-		UI:         UIConfig{Banner: true, Color: "auto"},
-		Discovery:  DiscoveryConfig{MaxDepth: 3, MaxHosts: 5000, MaxQueries: 10000, MaxDuration: 30 * time.Minute, SaturationThreshold: 0.03, SaturationConsecutiveDepths: 2},
+		Database:    DatabaseConfig{Path: defaultDatabasePath()},
+		Scheduler:   SchedulerConfig{Workers: 5, Saturation: SaturationConfig{Enabled: true, ConsecutiveZeroYieldPages: 2}, Recovery: RecoveryConfig{MaxWait: 2 * time.Minute}},
+		Retry:       RetryConfig{MaxAttempts: 4, BaseDelay: 2 * time.Second, MaxDelay: 2 * time.Minute, Jitter: true},
+		HTTP:        HTTPConfig{RequestTimeout: 20 * time.Second, ConnectTimeout: 5 * time.Second, MaxBodyBytes: 4 << 20},
+		Validation:  ValidationConfig{Mode: "conservative"},
+		Output:      OutputConfig{Collapse: "none", Directory: defaultOutputPath()},
+		UI:          UIConfig{Banner: true, Color: "auto"},
+		Discovery:   DiscoveryConfig{MaxDepth: 3, MaxHosts: 5000, MaxQueries: 10000, MaxDuration: 30 * time.Minute, SaturationThreshold: 0.03, SaturationConsecutiveDepths: 2},
+		UpdateCheck: UpdateCheckConfig{Enabled: true},
 		Providers: map[string]ProviderConfig{
 			"searxng":    {Enabled: true, RequestsPerSecond: 1, Burst: 1},
 			"google-api": {Enabled: true, RequestsPerSecond: 1, Burst: 1},
@@ -120,6 +125,7 @@ func defaultDatabasePath() string {
 // path rules.
 func DefaultDatabasePath() string { return defaultDatabasePath() }
 func DefaultOutputPath() string   { return defaultOutputPath() }
+func UpdateCachePath() string     { return filepath.Join(defaultDataDir(), "update.json") }
 
 func defaultDataDir() string {
 	home, _ := os.UserHomeDir()

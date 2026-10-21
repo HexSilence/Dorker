@@ -124,7 +124,7 @@ func (r *Renderer) Startup() {
 		fmt.Fprintln(r.w, "  "+r.commandLine(x))
 	}
 	fmt.Fprintln(r.w, "\n"+r.Heading("Commands"))
-	r.rows([]Row{{"search", "Find and collect URLs"}, {"discover", "Recursively expand in-scope hosts"}, {"ghdb", "Browse ready-made dorks"}, {"setup", "Create a working configuration"}, {"doctor", "Inspect the local environment"}, {"providers", "Check provider health"}, {"query", "Explain or validate a query"}, {"jobs", "Browse saved jobs"}, {"resume", "Continue a job"}})
+	r.rows([]Row{{"search", "Find and collect URLs"}, {"discover", "Recursively expand in-scope hosts"}, {"ghdb", "Browse ready-made dorks"}, {"setup", "Create a working configuration"}, {"doctor", "Inspect the local environment"}, {"providers", "Check provider health"}, {"query", "Explain or validate a query"}, {"jobs", "Browse saved jobs"}, {"resume", "Continue a job"}, {"update", "Update to the latest stable release"}})
 	fmt.Fprintln(r.w, "\n"+r.Heading("More"))
 	fmt.Fprintln(r.w, "  "+r.Command("dorker --help"))
 }
@@ -166,7 +166,7 @@ removes duplicates, and keeps track of where each URL came from.
 	fmt.Fprintln(r.w, "\n"+r.Heading("COMMANDS"))
 	r.rows([]Row{{"search", "Find and collect URLs"}, {"discover", "Recursively expand in-scope hosts"}, {"ghdb", "Browse ready-made dorks"}, {"setup", "Create a working configuration"}, {"doctor", "Inspect the local environment"}, {"providers", "Check provider health"}, {"query", "Explain or validate queries"}, {"jobs", "Browse saved jobs"}, {"resume", "Continue a job"}})
 	fmt.Fprintln(r.w, "\n"+r.Heading("OTHER COMMANDS"))
-	r.rows([]Row{{"stats", "Show job statistics"}, {"export", "Export a saved job"}, {"config", "Show or check configuration"}, {"version", "Show version info"}})
+	r.rows([]Row{{"stats", "Show job statistics"}, {"export", "Export a saved job"}, {"config", "Show or check configuration"}, {"version", "Show version info"}, {"update", "Update to the latest stable release"}})
 	fmt.Fprintln(r.w, "\n"+r.Heading("EXAMPLES"))
 	for _, x := range []string{"dorker search -q 'site:example.com'", "dorker discover -q 'site:example.com'", "dorker ghdb", "dorker search -q 'site:example.com ext:pdf' > results.txt", "dorker providers test searxng"} {
 		fmt.Fprintln(r.w, "  "+r.commandLine(x))
@@ -395,6 +395,15 @@ Discovery jobs restore their saved frontier, limits, and owned output directory.
 Usage:
   dorker version
   dorker --version
+`
+	case "update":
+		text = `Check for and install the latest stable Dorker release.
+
+Usage:
+  dorker update
+
+An available update requires interactive confirmation. Unknown or unsupported
+installation methods receive an exact safe installation command.
 `
 	default:
 		return false

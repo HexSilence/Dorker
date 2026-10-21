@@ -45,6 +45,7 @@ import (
 	"github.com/HexSilence/dorker/internal/scheduler"
 	"github.com/HexSilence/dorker/internal/store"
 	"github.com/HexSilence/dorker/internal/ui"
+	updater "github.com/HexSilence/dorker/internal/update"
 	"gopkg.in/yaml.v3"
 )
 
@@ -60,6 +61,21 @@ type multiFlag []string
 func (m *multiFlag) String() string     { return strings.Join(*m, ",") }
 func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
 func Run(args []string, streams IO) int {
+	updates := startPassiveUpdate(args, streams)
+	code := runCLI(args, streams)
+	if code == 0 && updates != nil {
+		select {
+		case release := <-updates:
+			if updater.Compare(release.Version, buildinfo.ProductVersion()) > 0 {
+				fmt.Fprintf(streams.Err, "\nUpdate available · %s -> %s\nRun `dorker update`\n", buildinfo.ProductVersion(), release.Version)
+			}
+		default:
+		}
+	}
+	return code
+}
+
+func runCLI(args []string, streams IO) int {
 	for len(args) > 0 && (args[0] == "--quiet" || args[0] == "--no-banner" || args[0] == "--color") {
 		if args[0] == "--color" {
 			if len(args) < 2 || (args[1] != "auto" && args[1] != "always" && args[1] != "never") {
@@ -168,6 +184,8 @@ func Run(args []string, streams IO) int {
 	case "version":
 		fmt.Fprintln(streams.Out, buildinfo.String())
 		return 0
+	case "update":
+		return runUpdate(args, streams)
 	case "help", "--help", "-h":
 		ui.Help(streams.Out)
 		return 0
@@ -176,6 +194,177 @@ func Run(args []string, streams IO) int {
 		ui.Help(streams.Err)
 		return 2
 	}
+}
+
+var (
+	newUpdateClient = func() *updater.Client {
+		return updater.New(config.UpdateCachePath(), "Dorker/"+buildinfo.ProductVersion(), 5*time.Second)
+	}
+	runtimeInstallation = updater.RuntimeInstallation
+	runUpdateCommand    = func(ctx context.Context, goBinary, goBin, version string) error {
+		cmd := exec.CommandContext(ctx, goBinary, "install", "github.com/HexSilence/dorker/cmd/dorker@"+version)
+		cmd.Env = append(os.Environ(), "GOBIN="+goBin)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("go install failed: %s", strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+	verifyUpdateBinary = func(ctx context.Context, path, version string) error {
+		out, err := exec.CommandContext(ctx, path, "version").CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("updated binary verification failed: %w", err)
+		}
+		if !strings.Contains(string(out), version) {
+			return fmt.Errorf("updated binary verification returned %q", strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+	backupUpdateBinary  = backupExecutable
+	restoreUpdateBinary = func(backup, target string) error { return os.Rename(backup, target) }
+	discardUpdateBackup = func(path string) error { return os.Remove(path) }
+)
+
+func runUpdate(args []string, ioo IO) int {
+	if len(args) != 0 {
+		return fail(ioo.Err, 2, errors.New("update takes no arguments or options"))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	release, err := newUpdateClient().Latest(ctx, true)
+	if err != nil {
+		return fail(ioo.Err, 1, fmt.Errorf("check latest stable release: %w", err))
+	}
+	installed := buildinfo.ProductVersion()
+	r := ui.New(ioo.Out, ui.Options{Color: streamColor(ioo, ui.ColorAuto), Interactive: ui.IsTerminal(ioo.Out) || ioo.Color == "always"})
+	fmt.Fprintln(ioo.Out, r.Heading("DORKER / UPDATE"))
+	fmt.Fprintf(ioo.Out, "\n  %-14s %s\n  %-14s %s\n", r.Muted("Installed"), r.Value(installed), r.Muted("Latest"), r.Value(release.Version))
+	if updater.Compare(release.Version, installed) <= 0 {
+		fmt.Fprintf(ioo.Out, "  %-14s %s\n", r.Muted("Status"), r.Value("Up to date"))
+		return 0
+	}
+	fmt.Fprintf(ioo.Out, "  %-14s %s\n\n  %s -> %s\n", r.Muted("Status"), r.Value("Update available"), installed, release.Version)
+	installation := runtimeInstallation()
+	manual := "go install github.com/HexSilence/dorker/cmd/dorker@" + release.Version
+	if installation.Method != "go" || runtime.GOOS == "windows" {
+		fmt.Fprintf(ioo.Out, "\nAutomatic replacement is not safe for this installation.\nRun:\n\n  %s\n", manual)
+		return 0
+	}
+	interactive := false
+	if f, ok := ioo.In.(*os.File); ok {
+		interactive = ui.IsTerminal(f)
+	}
+	if ioo.Interactive != nil {
+		interactive = *ioo.Interactive
+	}
+	if !interactive {
+		fmt.Fprintln(ioo.Out, "\nInteractive confirmation is required; no changes were made.")
+		fmt.Fprintf(ioo.Out, "Run interactively, or use:\n\n  %s\n", manual)
+		return 0
+	}
+	fmt.Fprintf(ioo.Out, "\nUpdate Dorker to %s? [y/N] ", release.Version)
+	answer, readErr := bufio.NewReader(ioo.In).ReadString('\n')
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		return fail(ioo.Err, 1, readErr)
+	}
+	answer = strings.ToLower(strings.TrimSpace(answer))
+	if answer != "y" && answer != "yes" {
+		fmt.Fprintln(ioo.Out, "Update cancelled.")
+		return 0
+	}
+	updateCtx, updateCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer updateCancel()
+	backup, err := backupUpdateBinary(installation.Executable)
+	if err != nil {
+		return fail(ioo.Err, 1, fmt.Errorf("prepare safe update: %w", err))
+	}
+	if err = runUpdateCommand(updateCtx, installation.GoBinary, installation.GoBin, release.Version); err != nil {
+		if restoreErr := restoreUpdateBinary(backup, installation.Executable); restoreErr != nil {
+			return fail(ioo.Err, 1, fmt.Errorf("%v; restore previous executable: %w", err, restoreErr))
+		}
+		return fail(ioo.Err, 1, err)
+	}
+	if err = verifyUpdateBinary(updateCtx, installation.Executable, release.Version); err != nil {
+		if restoreErr := restoreUpdateBinary(backup, installation.Executable); restoreErr != nil {
+			return fail(ioo.Err, 1, fmt.Errorf("%v; restore previous executable: %w", err, restoreErr))
+		}
+		return fail(ioo.Err, 1, err)
+	}
+	_ = discardUpdateBackup(backup)
+	fmt.Fprintf(ioo.Out, "Updated Dorker to %s.\n", release.Version)
+	return 0
+}
+
+func backupExecutable(source string) (string, error) {
+	in, err := os.Open(source)
+	if err != nil {
+		return "", err
+	}
+	defer in.Close()
+	info, err := in.Stat()
+	if err != nil {
+		return "", err
+	}
+	if info.Size() > 256<<20 {
+		return "", errors.New("installed executable exceeds safe backup limit")
+	}
+	out, err := os.CreateTemp(filepath.Dir(source), ".dorker-update-backup-*")
+	if err != nil {
+		return "", err
+	}
+	backup := out.Name()
+	ok := false
+	defer func() {
+		_ = out.Close()
+		if !ok {
+			_ = os.Remove(backup)
+		}
+	}()
+	if err = out.Chmod(info.Mode().Perm()); err == nil {
+		_, err = io.Copy(out, io.LimitReader(in, 256<<20))
+	}
+	if err == nil {
+		err = out.Sync()
+	}
+	if closeErr := out.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return "", err
+	}
+	ok = true
+	return backup, nil
+}
+
+func startPassiveUpdate(args []string, ioo IO) <-chan updater.Release {
+	if !passiveUpdateEnabled(args, ui.IsTerminal(ioo.Out)) {
+		return nil
+	}
+	cfg, err := config.Load("")
+	if err != nil || !cfg.UpdateCheck.Enabled {
+		return nil
+	}
+	results := make(chan updater.Release, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		release, err := newUpdateClient().Latest(ctx, false)
+		if err == nil {
+			results <- release
+		}
+	}()
+	return results
+}
+
+func passiveUpdateEnabled(args []string, terminal bool) bool {
+	if len(args) == 0 || !terminal || os.Getenv("DORKER_NO_UPDATE_CHECK") == "1" {
+		return false
+	}
+	command := strings.TrimLeft(args[0], "-")
+	if command == "help" || command == "h" || command == "version" || command == "update" || command == "" {
+		return false
+	}
+	return true
 }
 
 func runGHDB(args []string, ioo IO) int {

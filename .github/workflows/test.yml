@@ -36,6 +36,7 @@ jobs:
           "$ci_tmp/dorker-native$suffix" discover --help
           "$ci_tmp/dorker-native$suffix" ghdb --help
           "$ci_tmp/dorker-native$suffix" setup --help
+          "$ci_tmp/dorker-native$suffix" update --help
       - name: Install and run outside the repository
         shell: bash
         run: |
@@ -51,6 +52,7 @@ jobs:
           export DORKER_CONFIG="$outside/config.yaml"
           "$install_bin/dorker$suffix" version
           "$install_bin/dorker$suffix" --help
+          "$install_bin/dorker$suffix" update --help
           "$install_bin/dorker$suffix"
           "$install_bin/dorker$suffix" doctor
       - if: runner.os == 'Linux'

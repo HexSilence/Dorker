@@ -17,13 +17,13 @@ func TestResolveMetadata(t *testing.T) {
 		{
 			name:     "explicit linker metadata wins",
 			explicit: metadata{Version: "v9.8.7", Commit: "abcdef123456", Date: "2026-10-19T01:02:03Z"},
-			info:     buildInfo("v1.0.0", revision, "2026-10-18T22:00:00Z", "true"),
+			info:     buildInfo("v1.0.1", revision, "2026-10-18T22:00:00Z", "true"),
 			want:     metadata{Version: "v9.8.7", Commit: "abcdef1", Date: "2026-10-19T01:02:03Z", DateKey: "built"},
 		},
 		{
 			name: "module version fallback",
-			info: &debug.BuildInfo{Main: debug.Module{Version: "v1.0.0"}},
-			want: metadata{Version: "v1.0.0"},
+			info: &debug.BuildInfo{Main: debug.Module{Version: "v1.0.1"}},
+			want: metadata{Version: "v1.0.1"},
 		},
 		{
 			name: "VCS fallback and dirty marker",
@@ -64,8 +64,8 @@ func TestResolveDoesNotGenerateCurrentTimestamp(t *testing.T) {
 func TestStringOmitsUnavailableMetadata(t *testing.T) {
 	oldVersion, oldCommit, oldDate, oldDateKey := Version, Commit, Date, dateKey
 	t.Cleanup(func() { Version, Commit, Date, dateKey = oldVersion, oldCommit, oldDate, oldDateKey })
-	Version, Commit, Date, dateKey = "v1.0.0", "", "", ""
-	if got := String(); got != "dorker v1.0.0" || strings.Contains(got, "unknown") {
+	Version, Commit, Date, dateKey = "v1.0.1", "", "", ""
+	if got := String(); got != "dorker v1.0.1" || strings.Contains(got, "unknown") {
 		t.Fatal(got)
 	}
 }

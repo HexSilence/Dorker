@@ -21,6 +21,7 @@ import (
 	"github.com/HexSilence/dorker/internal/model"
 	"github.com/HexSilence/dorker/internal/scheduler"
 	"github.com/HexSilence/dorker/internal/store"
+	updater "github.com/HexSilence/dorker/internal/update"
 	"gopkg.in/yaml.v3"
 )
 
@@ -140,7 +141,7 @@ func TestSearchHelpSections(t *testing.T) {
 }
 
 func TestCommandHelpReturnsSuccess(t *testing.T) {
-	for _, args := range [][]string{{"providers", "--help"}, {"providers", "test", "--help"}, {"query", "--help"}, {"query", "validate", "--help"}, {"jobs", "--help"}, {"stats", "--help"}, {"export", "--help"}, {"config", "--help"}, {"config", "init", "--help"}, {"config", "check", "--help"}, {"version", "--help"}, {"setup", "searxng", "--help"}} {
+	for _, args := range [][]string{{"providers", "--help"}, {"providers", "test", "--help"}, {"query", "--help"}, {"query", "validate", "--help"}, {"jobs", "--help"}, {"stats", "--help"}, {"export", "--help"}, {"config", "--help"}, {"config", "init", "--help"}, {"config", "check", "--help"}, {"version", "--help"}, {"update", "--help"}, {"setup", "searxng", "--help"}} {
 		var out, stderr bytes.Buffer
 		if code := Run(args, IO{Out: &out, Err: &stderr}); code != 0 {
 			t.Fatalf("%v code=%d stderr=%s", args, code, stderr.String())
@@ -401,7 +402,7 @@ func TestCanonicalVersionFlag(t *testing.T) {
 	if code := Run([]string{"--version"}, IO{Out: &out, Err: &out}); code != 0 {
 		t.Fatal(code)
 	}
-	if !strings.Contains(out.String(), "v1.0.0") {
+	if !strings.Contains(out.String(), "v1.0.1") {
 		t.Fatal(out.String())
 	}
 }
@@ -848,6 +849,187 @@ func TestProgressLineHidesZeroCounters(t *testing.T) {
 	if got := progressLine(63, 10, 4); got != "Searching... 63 unique · 10 rejected · 4 duplicates" {
 		t.Fatal(got)
 	}
+}
+
+func TestUpdateCurrentIsNoOp(t *testing.T) {
+	t.Setenv("DORKER_NO_UPDATE_CHECK", "1")
+	restoreUpdateGlobals(t)
+	newUpdateClient = func() *updater.Client { return releaseTestClient(t, "v1.0.1") }
+	runtimeInstallation = func() updater.Installation {
+		t.Fatal("installation detection should not run")
+		return updater.Installation{}
+	}
+	var out, stderr bytes.Buffer
+	if code := runUpdate(nil, IO{In: strings.NewReader(""), Out: &out, Err: &stderr}); code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	for _, want := range []string{"DORKER / UPDATE", "v1.0.1", "Up to date"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("missing %q in %s", want, out.String())
+		}
+	}
+}
+
+func TestUpdateRejectsSubcommandsAndOptions(t *testing.T) {
+	for _, args := range [][]string{{"check"}, {"--" + "check"}, {"--" + "yes"}} {
+		var out, stderr bytes.Buffer
+		if code := runUpdate(args, IO{In: strings.NewReader(""), Out: &out, Err: &stderr}); code != 2 {
+			t.Fatalf("args=%v code=%d", args, code)
+		}
+	}
+}
+
+func TestUpdateVerificationFailureRestoresPreviousExecutable(t *testing.T) {
+	restoreUpdateGlobals(t)
+	newUpdateClient = func() *updater.Client { return releaseTestClient(t, "v1.0.2") }
+	runtimeInstallation = func() updater.Installation {
+		return updater.Installation{Method: "go", Executable: "/tmp/dorker", GoBinary: "go", GoBin: "/tmp/bin"}
+	}
+	backupUpdateBinary = func(string) (string, error) { return "/tmp/backup", nil }
+	runUpdateCommand = func(context.Context, string, string, string) error { return nil }
+	verifyUpdateBinary = func(context.Context, string, string) error { return errors.New("wrong version") }
+	restored := false
+	restoreUpdateBinary = func(string, string) error { restored = true; return nil }
+	discardUpdateBackup = func(string) error { return nil }
+	interactive := true
+	var out, stderr bytes.Buffer
+	if code := runUpdate(nil, IO{In: strings.NewReader("y\n"), Out: &out, Err: &stderr, Interactive: &interactive}); code == 0 {
+		t.Fatal("verification failure returned success")
+	}
+	if !restored || strings.Contains(out.String(), "Updated Dorker") {
+		t.Fatalf("restored=%v out=%s", restored, out.String())
+	}
+}
+
+func TestBackupExecutablePreservesContentAndMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dorker")
+	if err := os.WriteFile(path, []byte("working binary"), 0750); err != nil {
+		t.Fatal(err)
+	}
+	backup, err := backupExecutable(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(backup)
+	if err != nil || string(b) != "working binary" {
+		t.Fatalf("backup=%q err=%v", b, err)
+	}
+	info, err := os.Stat(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0750 {
+		t.Fatalf("mode=%v", info.Mode().Perm())
+	}
+}
+
+func TestUpdateAvailableConfirmationPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name, input string
+		interactive bool
+		updated     bool
+		want        string
+	}{
+		{"declined", "n\n", true, false, "Update cancelled."},
+		{"EOF", "", true, false, "Update cancelled."},
+		{"noninteractive", "yes\n", false, false, "Interactive confirmation is required"},
+		{"confirmed", "yes\n", true, true, "Updated Dorker to v1.0.2."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			restoreUpdateGlobals(t)
+			newUpdateClient = func() *updater.Client { return releaseTestClient(t, "v1.0.2") }
+			runtimeInstallation = func() updater.Installation {
+				return updater.Installation{Method: "go", Executable: "/tmp/dorker", GoBinary: "go", GoBin: "/tmp/bin"}
+			}
+			called := false
+			runUpdateCommand = func(context.Context, string, string, string) error { called = true; return nil }
+			verifyUpdateBinary = func(context.Context, string, string) error { return nil }
+			backupUpdateBinary = func(string) (string, error) { return "/tmp/backup", nil }
+			restoreUpdateBinary = func(string, string) error { return nil }
+			discardUpdateBackup = func(string) error { return nil }
+			var out, stderr bytes.Buffer
+			interactive := tc.interactive
+			code := runUpdate(nil, IO{In: strings.NewReader(tc.input), Out: &out, Err: &stderr, Interactive: &interactive})
+			if code != 0 || called != tc.updated || !strings.Contains(out.String(), tc.want) {
+				t.Fatalf("code=%d called=%v out=%s err=%s", code, called, out.String(), stderr.String())
+			}
+		})
+	}
+}
+
+func TestUpdateUnknownInstallationUsesSafeFallback(t *testing.T) {
+	restoreUpdateGlobals(t)
+	newUpdateClient = func() *updater.Client { return releaseTestClient(t, "v2.0.0") }
+	runtimeInstallation = func() updater.Installation { return updater.Installation{Method: "unknown"} }
+	runUpdateCommand = func(context.Context, string, string, string) error { t.Fatal("must not execute"); return nil }
+	var out, stderr bytes.Buffer
+	if code := runUpdate(nil, IO{In: strings.NewReader("yes\n"), Out: &out, Err: &stderr}); code != 0 {
+		t.Fatalf("code=%d err=%s", code, stderr.String())
+	}
+	if !strings.Contains(out.String(), "go install github.com/HexSilence/dorker/cmd/dorker@v2.0.0") {
+		t.Fatal(out.String())
+	}
+}
+
+func TestUpdateFailureDoesNotClaimSuccess(t *testing.T) {
+	restoreUpdateGlobals(t)
+	newUpdateClient = func() *updater.Client { return releaseTestClient(t, "v1.1.0") }
+	runtimeInstallation = func() updater.Installation {
+		return updater.Installation{Method: "go", Executable: "/tmp/dorker", GoBinary: "go", GoBin: "/tmp/bin"}
+	}
+	runUpdateCommand = func(context.Context, string, string, string) error { return errors.New("install failed safely") }
+	backupUpdateBinary = func(string) (string, error) { return "/tmp/backup", nil }
+	restored := false
+	restoreUpdateBinary = func(string, string) error { restored = true; return nil }
+	discardUpdateBackup = func(string) error { return nil }
+	interactive := true
+	var out, stderr bytes.Buffer
+	if code := runUpdate(nil, IO{In: strings.NewReader("y\n"), Out: &out, Err: &stderr, Interactive: &interactive}); code == 0 {
+		t.Fatal("failure returned success")
+	}
+	if strings.Contains(out.String(), "Updated Dorker") {
+		t.Fatal("claimed success")
+	}
+	if !restored {
+		t.Fatal("previous executable was not restored")
+	}
+}
+
+func TestPassiveUpdateControls(t *testing.T) {
+	if !passiveUpdateEnabled([]string{"search"}, true) {
+		t.Fatal("interactive search disabled")
+	}
+	for _, args := range [][]string{nil, {"--help"}, {"version"}, {"update"}} {
+		if passiveUpdateEnabled(args, true) {
+			t.Fatalf("enabled for %v", args)
+		}
+	}
+	if passiveUpdateEnabled([]string{"search"}, false) {
+		t.Fatal("enabled for redirected output")
+	}
+	t.Setenv("DORKER_NO_UPDATE_CHECK", "1")
+	if passiveUpdateEnabled([]string{"search"}, true) {
+		t.Fatal("environment disable ignored")
+	}
+}
+
+func releaseTestClient(t *testing.T, version string) *updater.Client {
+	t.Helper()
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintf(w, `[{"tag_name":%q,"draft":false,"prerelease":false}]`, version)
+	}))
+	t.Cleanup(s.Close)
+	return &updater.Client{HTTP: s.Client(), Endpoint: s.URL, CachePath: filepath.Join(t.TempDir(), "update.json"), TTL: 24 * time.Hour, Now: time.Now}
+}
+
+func restoreUpdateGlobals(t *testing.T) {
+	t.Helper()
+	oldClient, oldInstall, oldRun, oldVerify := newUpdateClient, runtimeInstallation, runUpdateCommand, verifyUpdateBinary
+	oldBackup, oldRestore, oldDiscard := backupUpdateBinary, restoreUpdateBinary, discardUpdateBackup
+	t.Cleanup(func() {
+		newUpdateClient, runtimeInstallation, runUpdateCommand, verifyUpdateBinary = oldClient, oldInstall, oldRun, oldVerify
+		backupUpdateBinary, restoreUpdateBinary, discardUpdateBackup = oldBackup, oldRestore, oldDiscard
+	})
 }
 
 func TestSetupSearXNGPreservesInstancesAndIsIdempotent(t *testing.T) {

@@ -87,3 +87,20 @@ func TestUIColorMode(t *testing.T) {
 		t.Fatal("expected invalid color mode")
 	}
 }
+
+func TestUpdateCheckDefaultsAndCanBeDisabled(t *testing.T) {
+	if !Default().UpdateCheck.Enabled {
+		t.Fatal("passive release awareness should default on")
+	}
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("update_check:\n  enabled: false\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.UpdateCheck.Enabled {
+		t.Fatal("explicit disable ignored")
+	}
+}

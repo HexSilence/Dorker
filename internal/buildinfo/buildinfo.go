@@ -10,7 +10,16 @@ import (
 
 const Name = "dorker"
 const EnvPrefix = "DORKER"
-const ReleaseVersion = "v1.0.0"
+const ReleaseVersion = "v1.0.1"
+
+// ProductVersion is the stable product identity used for release comparison.
+// Pseudo-version and development builds deliberately retain ReleaseVersion.
+func ProductVersion() string {
+	if releaseVersion.MatchString(Version) {
+		return Version
+	}
+	return ReleaseVersion
+}
 
 var (
 	Version = "unknown"
@@ -26,7 +35,10 @@ type metadata struct {
 	DateKey string
 }
 
-var pseudoVersion = regexp.MustCompile(`^v\d+\.\d+\.\d+-(?:0\.)?(\d{14})-([0-9a-f]{12,})(?:\+.*)?$`)
+var (
+	pseudoVersion  = regexp.MustCompile(`^v\d+\.\d+\.\d+-(?:0\.)?(\d{14})-([0-9a-f]{12,})(?:\+.*)?$`)
+	releaseVersion = regexp.MustCompile(`^v\d+\.\d+\.\d+$`)
+)
 
 func init() {
 	var info *debug.BuildInfo
