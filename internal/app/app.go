@@ -220,9 +220,12 @@ var (
 		}
 		return nil
 	}
-	backupUpdateBinary  = backupExecutable
-	restoreUpdateBinary = func(backup, target string) error { return os.Rename(backup, target) }
-	discardUpdateBackup = func(path string) error { return os.Remove(path) }
+	backupUpdateBinary       = backupExecutable
+	restoreUpdateBinary      = func(backup, target string) error { return os.Rename(backup, target) }
+	discardUpdateBackup      = func(path string) error { return os.Remove(path) }
+	automaticUpdateSupported = func(installation updater.Installation) bool {
+		return installation.Method == "go" && runtime.GOOS != "windows"
+	}
 )
 
 func runUpdate(args []string, ioo IO) int {
@@ -246,7 +249,7 @@ func runUpdate(args []string, ioo IO) int {
 	fmt.Fprintf(ioo.Out, "  %-14s %s\n\n  %s -> %s\n", r.Muted("Status"), r.Value("Update available"), installed, release.Version)
 	installation := runtimeInstallation()
 	manual := "go install github.com/HexSilence/dorker/cmd/dorker@" + release.Version
-	if installation.Method != "go" || runtime.GOOS == "windows" {
+	if !automaticUpdateSupported(installation) {
 		fmt.Fprintf(ioo.Out, "\nAutomatic replacement is not safe for this installation.\nRun:\n\n  %s\n", manual)
 		return 0
 	}

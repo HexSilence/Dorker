@@ -885,6 +885,7 @@ func TestUpdateVerificationFailureRestoresPreviousExecutable(t *testing.T) {
 	runtimeInstallation = func() updater.Installation {
 		return updater.Installation{Method: "go", Executable: "/tmp/dorker", GoBinary: "go", GoBin: "/tmp/bin"}
 	}
+	automaticUpdateSupported = func(updater.Installation) bool { return true }
 	backupUpdateBinary = func(string) (string, error) { return "/tmp/backup", nil }
 	runUpdateCommand = func(context.Context, string, string, string) error { return nil }
 	verifyUpdateBinary = func(context.Context, string, string) error { return errors.New("wrong version") }
@@ -918,7 +919,7 @@ func TestBackupExecutablePreservesContentAndMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0750 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0750 {
 		t.Fatalf("mode=%v", info.Mode().Perm())
 	}
 }
@@ -941,6 +942,7 @@ func TestUpdateAvailableConfirmationPaths(t *testing.T) {
 			runtimeInstallation = func() updater.Installation {
 				return updater.Installation{Method: "go", Executable: "/tmp/dorker", GoBinary: "go", GoBin: "/tmp/bin"}
 			}
+			automaticUpdateSupported = func(updater.Installation) bool { return true }
 			called := false
 			runUpdateCommand = func(context.Context, string, string, string) error { called = true; return nil }
 			verifyUpdateBinary = func(context.Context, string, string) error { return nil }
@@ -977,6 +979,7 @@ func TestUpdateFailureDoesNotClaimSuccess(t *testing.T) {
 	runtimeInstallation = func() updater.Installation {
 		return updater.Installation{Method: "go", Executable: "/tmp/dorker", GoBinary: "go", GoBin: "/tmp/bin"}
 	}
+	automaticUpdateSupported = func(updater.Installation) bool { return true }
 	runUpdateCommand = func(context.Context, string, string, string) error { return errors.New("install failed safely") }
 	backupUpdateBinary = func(string) (string, error) { return "/tmp/backup", nil }
 	restored := false
@@ -1026,9 +1029,11 @@ func restoreUpdateGlobals(t *testing.T) {
 	t.Helper()
 	oldClient, oldInstall, oldRun, oldVerify := newUpdateClient, runtimeInstallation, runUpdateCommand, verifyUpdateBinary
 	oldBackup, oldRestore, oldDiscard := backupUpdateBinary, restoreUpdateBinary, discardUpdateBackup
+	oldSupported := automaticUpdateSupported
 	t.Cleanup(func() {
 		newUpdateClient, runtimeInstallation, runUpdateCommand, verifyUpdateBinary = oldClient, oldInstall, oldRun, oldVerify
 		backupUpdateBinary, restoreUpdateBinary, discardUpdateBackup = oldBackup, oldRestore, oldDiscard
+		automaticUpdateSupported = oldSupported
 	})
 }
 
