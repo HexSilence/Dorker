@@ -971,10 +971,17 @@ func TestSetupSearXNGRejectsInconsistentOwnershipWithoutMutation(t *testing.T) {
 	originalLook, originalCommand, originalReady := setupLookPath, setupCommand, setupReady
 	t.Cleanup(func() { setupLookPath, setupCommand, setupReady = originalLook, originalCommand, originalReady })
 	setupLookPath = func(name string) (string, error) { return "/fake/" + name, nil }
+	actualSettings := filepath.Join(t.TempDir(), "actual", "searxng", "settings.yml")
+	claimedSettings := filepath.Join(t.TempDir(), "claimed", "searxng", "settings.yml")
+	var inspected []searxContainerInspect
+	if err := json.Unmarshal(compatibleSearXNGInspect(actualSettings, true, map[string]string{searxSettingsLabel: claimedSettings}), &inspected); err != nil {
+		t.Fatal(err)
+	}
+	inspectJSON, _ := json.Marshal(inspected)
 	var operations []string
 	setupCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
 		operations = append(operations, args[0])
-		return []byte(`[{"Config":{"Labels":{"io.github.hexsilence.dorker.searxng-settings":"/claimed/searxng/settings.yml"},"Image":"ghcr.io/searxng/searxng:legacy"},"State":{"Running":true},"NetworkSettings":{"Ports":{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"8080"}]}},"Mounts":[{"Type":"bind","Source":"/actual/searxng/settings.yml","Destination":"/etc/searxng/settings.yml","RW":false}]}]`), nil
+		return inspectJSON, nil
 	}
 	setupReady = func(context.Context) error { t.Fatal("readiness must not run on ownership conflict"); return nil }
 	dir := t.TempDir()
@@ -1214,7 +1221,7 @@ func TestLegacyContainerWithoutLabelIsRecognized(t *testing.T) {
 	withSetupFakes(t)
 	newHome := t.TempDir()
 	path := filepath.Join(newHome, ".config", "dorker", "config.yaml")
-	settings := "/old/home/.config/dorker-searxng/settings.yml"
+	settings := filepath.Join(t.TempDir(), "old", "home", ".config", "dorker-searxng", "settings.yml")
 	var legacy []searxContainerInspect
 	if err := json.Unmarshal(compatibleSearXNGInspect(settings, true, nil), &legacy); err != nil {
 		t.Fatal(err)
@@ -1271,7 +1278,7 @@ func TestLegacyContainerFingerprintRejectsIncompatibleContainers(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			withSetupFakes(t)
 			var containers []searxContainerInspect
-			if err := json.Unmarshal(compatibleSearXNGInspect("/old/home/settings.yml", true, nil), &containers); err != nil {
+			if err := json.Unmarshal(compatibleSearXNGInspect(filepath.Join(t.TempDir(), "old", "home", "settings.yml"), true, nil), &containers); err != nil {
 				t.Fatal(err)
 			}
 			tt.mutate(&containers[0])
