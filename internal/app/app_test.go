@@ -3,11 +3,15 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -847,28 +851,31 @@ func TestProgressLineHidesZeroCounters(t *testing.T) {
 }
 
 func TestSetupSearXNGPreservesInstancesAndIsIdempotent(t *testing.T) {
-	originalLook, originalCommand, originalReady := setupLookPath, setupCommand, setupReady
-	t.Cleanup(func() { setupLookPath, setupCommand, setupReady = originalLook, originalCommand, originalReady })
+	originalLook, originalCommand, originalReady, originalPort := setupLookPath, setupCommand, setupReady, setupPortFree
+	t.Cleanup(func() {
+		setupLookPath, setupCommand, setupReady, setupPortFree = originalLook, originalCommand, originalReady, originalPort
+	})
 	setupLookPath = func(name string) (string, error) { return "/fake/" + name, nil }
+	setupPortFree = func() bool { return true }
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 	settingsPath := filepath.Join(dir, "searxng", "settings.yml")
 	containerExists := false
 	var operations []string
-	setupCommand = func(_ string, args ...string) ([]byte, error) {
+	setupCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
 		operations = append(operations, args[0])
 		if args[0] == "inspect" && !containerExists {
-			return nil, fmt.Errorf("missing")
+			return nil, fmt.Errorf("not found")
 		}
 		if args[0] == "inspect" {
-			return []byte(fmt.Sprintf(`[{"Config":{"Labels":{}},"Mounts":[{"Source":%q,"Destination":"/etc/searxng/settings.yml"}]}]`, settingsPath)), nil
+			return []byte(fmt.Sprintf(`[{"Config":{"Labels":{},"Image":%q},"State":{"Running":true},"NetworkSettings":{"Ports":{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"8080"}]}},"Mounts":[{"Type":"bind","Source":%q,"Destination":"/etc/searxng/settings.yml","RW":false}]}]`, searxImage, settingsPath)), nil
 		}
 		if args[0] == "run" {
 			containerExists = true
 		}
 		return []byte("ok"), nil
 	}
-	setupReady = func() bool { return true }
+	setupReady = func(context.Context) error { return nil }
 	cfg := config.Default()
 	pc := cfg.Providers["searxng"]
 	pc.Strategy = "coverage"
@@ -895,7 +902,7 @@ func TestSetupSearXNGPreservesInstancesAndIsIdempotent(t *testing.T) {
 	if got.Providers["searxng"].Strategy != "coverage" {
 		t.Fatalf("strategy overwritten: %s", got.Providers["searxng"].Strategy)
 	}
-	if strings.Join(operations, ",") != "inspect,run,inspect,start" {
+	if strings.Join(operations, ",") != "inspect,run,inspect" {
 		t.Fatalf("operations=%v", operations)
 	}
 	if _, err = os.Stat(filepath.Join(dir, "searxng", "settings.yml")); err != nil {
@@ -960,16 +967,16 @@ func TestSearXNGReadinessConnectionRefused(t *testing.T) {
 	}
 }
 
-func TestSetupSearXNGRejectsDifferentManagedSettingsWithoutMutation(t *testing.T) {
+func TestSetupSearXNGRejectsInconsistentOwnershipWithoutMutation(t *testing.T) {
 	originalLook, originalCommand, originalReady := setupLookPath, setupCommand, setupReady
 	t.Cleanup(func() { setupLookPath, setupCommand, setupReady = originalLook, originalCommand, originalReady })
 	setupLookPath = func(name string) (string, error) { return "/fake/" + name, nil }
 	var operations []string
-	setupCommand = func(_ string, args ...string) ([]byte, error) {
+	setupCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
 		operations = append(operations, args[0])
-		return []byte(`[{"Config":{"Labels":{"io.github.hexsilence.dorker.searxng-settings":"/original/searxng/settings.yml"}},"Mounts":[{"Source":"/original/searxng/settings.yml","Destination":"/etc/searxng/settings.yml"}]}]`), nil
+		return []byte(`[{"Config":{"Labels":{"io.github.hexsilence.dorker.searxng-settings":"/claimed/searxng/settings.yml"},"Image":"ghcr.io/searxng/searxng:legacy"},"State":{"Running":true},"NetworkSettings":{"Ports":{"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"8080"}]}},"Mounts":[{"Type":"bind","Source":"/actual/searxng/settings.yml","Destination":"/etc/searxng/settings.yml","RW":false}]}]`), nil
 	}
-	setupReady = func() bool { t.Fatal("readiness must not run on ownership conflict"); return false }
+	setupReady = func(context.Context) error { t.Fatal("readiness must not run on ownership conflict"); return nil }
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
 	original := []byte("# preserve alternate config\n")
@@ -990,22 +997,25 @@ func TestSetupSearXNGRejectsDifferentManagedSettingsWithoutMutation(t *testing.T
 	if strings.Join(operations, ",") != "inspect" {
 		t.Fatalf("container was mutated: %v", operations)
 	}
-	if !strings.Contains(stderr.String(), "/original/searxng/settings.yml") {
+	if !strings.Contains(stderr.String(), "inconsistent Dorker ownership metadata") {
 		t.Fatalf("non-actionable error: %s", stderr.String())
 	}
 }
 
 func TestSetupSearXNGReadinessFailureDoesNotChangeConfig(t *testing.T) {
-	originalLook, originalCommand, originalReady := setupLookPath, setupCommand, setupReady
-	t.Cleanup(func() { setupLookPath, setupCommand, setupReady = originalLook, originalCommand, originalReady })
+	originalLook, originalCommand, originalReady, originalPort := setupLookPath, setupCommand, setupReady, setupPortFree
+	t.Cleanup(func() {
+		setupLookPath, setupCommand, setupReady, setupPortFree = originalLook, originalCommand, originalReady, originalPort
+	})
 	setupLookPath = func(name string) (string, error) { return "/fake/" + name, nil }
-	setupCommand = func(_ string, args ...string) ([]byte, error) {
+	setupPortFree = func() bool { return true }
+	setupCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
 		if args[0] == "inspect" {
-			return nil, fmt.Errorf("missing")
+			return nil, fmt.Errorf("not found")
 		}
 		return nil, nil
 	}
-	setupReady = func() bool { return false }
+	setupReady = func(context.Context) error { return fmt.Errorf("timeout") }
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	original := []byte("# untouched when readiness fails\n")
 	if err := os.WriteFile(path, original, 0600); err != nil {
@@ -1018,5 +1028,310 @@ func TestSetupSearXNGReadinessFailureDoesNotChangeConfig(t *testing.T) {
 	got, err := os.ReadFile(path)
 	if err != nil || !bytes.Equal(got, original) {
 		t.Fatalf("config changed: %q err=%v", got, err)
+	}
+}
+
+func compatibleSearXNGInspect(settingsPath string, running bool, labels map[string]string) []byte {
+	b, _ := json.Marshal([]searxContainerInspect{{}})
+	var containers []searxContainerInspect
+	_ = json.Unmarshal(b, &containers)
+	c := &containers[0]
+	c.Config.Image = searxImage
+	c.Config.Labels = labels
+	c.State.Running = running
+	c.NetworkSettings.Ports = map[string][]struct {
+		HostIP   string `json:"HostIp"`
+		HostPort string `json:"HostPort"`
+	}{"8080/tcp": {{HostIP: "127.0.0.1", HostPort: "8080"}}}
+	c.Mounts = append(c.Mounts, struct {
+		Type        string `json:"Type"`
+		Source      string `json:"Source"`
+		Destination string `json:"Destination"`
+		RW          bool   `json:"RW"`
+	}{Type: "bind", Source: settingsPath, Destination: searxSettingsTarget})
+	b, _ = json.Marshal(containers)
+	return b
+}
+
+func withSetupFakes(t *testing.T) {
+	t.Helper()
+	originalLook, originalCommand, originalReady := setupLookPath, setupCommand, setupReady
+	originalPort, originalProbe := setupPortFree, setupProbe
+	t.Cleanup(func() {
+		setupLookPath, setupCommand, setupReady = originalLook, originalCommand, originalReady
+		setupPortFree, setupProbe = originalPort, originalProbe
+	})
+	setupLookPath = func(name string) (string, error) { return "/fake/" + name, nil }
+	setupPortFree = func() bool { return true }
+	setupProbe = func(context.Context, *http.Client, string, int64) error { return fmt.Errorf("not SearXNG") }
+	setupReady = func(context.Context) error { return nil }
+}
+
+func TestSetupSearXNGPreviewDoesNotMutate(t *testing.T) {
+	withSetupFakes(t)
+	var operations []string
+	setupCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		operations = append(operations, args[0])
+		return nil, fmt.Errorf("not found")
+	}
+	dir := t.TempDir()
+	var out, stderr bytes.Buffer
+	if code := setupSearXNG([]string{"--config", filepath.Join(dir, "config.yaml")}, IO{Out: &out, Err: &stderr}); code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	if strings.Join(operations, ",") != "inspect" {
+		t.Fatalf("mutating operations: %v", operations)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "searxng")); !os.IsNotExist(err) {
+		t.Fatalf("preview created files: %v", err)
+	}
+}
+
+func TestSetupSearXNGStartsStoppedCompatibleContainer(t *testing.T) {
+	withSetupFakes(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	settings := filepath.Join(dir, "searxng", "settings.yml")
+	var operations []string
+	setupCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		operations = append(operations, args[0])
+		if args[0] == "inspect" {
+			return compatibleSearXNGInspect(settings, false, nil), nil
+		}
+		return nil, nil
+	}
+	var out, stderr bytes.Buffer
+	if code := setupSearXNG([]string{"--yes", "--config", path}, IO{Out: &out, Err: &stderr}); code != 0 {
+		t.Fatalf("code=%d stderr=%s", code, stderr.String())
+	}
+	if strings.Join(operations, ",") != "inspect,start" {
+		t.Fatalf("operations=%v", operations)
+	}
+}
+
+func TestSetupSearXNGRunningUnhealthyIsNotMutated(t *testing.T) {
+	withSetupFakes(t)
+	dir := t.TempDir()
+	settings := filepath.Join(dir, "searxng", "settings.yml")
+	setupReady = func(context.Context) error { return fmt.Errorf("HTTP 503") }
+	var operations []string
+	setupCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		operations = append(operations, args[0])
+		return compatibleSearXNGInspect(settings, true, nil), nil
+	}
+	var out, stderr bytes.Buffer
+	if code := setupSearXNG([]string{"--yes", "--config", filepath.Join(dir, "config.yaml")}, IO{Out: &out, Err: &stderr}); code == 0 {
+		t.Fatal("unhealthy container succeeded")
+	}
+	if strings.Join(operations, ",") != "inspect" || !strings.Contains(stderr.String(), "dorker-searxng") || !strings.Contains(stderr.String(), "HTTP 503") {
+		t.Fatalf("operations=%v stderr=%s", operations, stderr.String())
+	}
+}
+
+func TestSetupSearXNGOccupiedPortConflicts(t *testing.T) {
+	for _, healthy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("healthy=%v", healthy), func(t *testing.T) {
+			withSetupFakes(t)
+			setupPortFree = func() bool { return false }
+			if healthy {
+				setupProbe = func(context.Context, *http.Client, string, int64) error { return nil }
+			}
+			var operations []string
+			setupCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+				operations = append(operations, args[0])
+				return nil, fmt.Errorf("not found")
+			}
+			var out, stderr bytes.Buffer
+			if code := setupSearXNG([]string{"--yes", "--config", filepath.Join(t.TempDir(), "config.yaml")}, IO{Out: &out, Err: &stderr}); code == 0 {
+				t.Fatal("occupied port succeeded")
+			}
+			if strings.Join(operations, ",") != "inspect" || !strings.Contains(stderr.String(), "127.0.0.1:8080") {
+				t.Fatalf("operations=%v stderr=%s", operations, stderr.String())
+			}
+			if healthy && !strings.Contains(stderr.String(), "external SearXNG") {
+				t.Fatalf("missing external guidance: %s", stderr.String())
+			}
+		})
+	}
+}
+
+func TestSetupSearXNGRuntimeBindRaceIsClassified(t *testing.T) {
+	withSetupFakes(t)
+	var operations []string
+	setupCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		operations = append(operations, args[0])
+		if args[0] == "inspect" {
+			return nil, fmt.Errorf("not found")
+		}
+		return []byte("pasta failed: address already in use\nlarge runtime noise"), fmt.Errorf("exit 1")
+	}
+	var out, stderr bytes.Buffer
+	if code := setupSearXNG([]string{"--yes", "--config", filepath.Join(t.TempDir(), "config.yaml")}, IO{Out: &out, Err: &stderr}); code == 0 {
+		t.Fatal("bind race succeeded")
+	}
+	if strings.Join(operations, ",") != "inspect,run" || !strings.Contains(stderr.String(), "became unavailable") || strings.Contains(stderr.String(), "pasta failed") {
+		t.Fatalf("operations=%v stderr=%s", operations, stderr.String())
+	}
+}
+
+func TestSetupSearXNGRuntimePreference(t *testing.T) {
+	for _, tt := range []struct {
+		name, missing, want string
+	}{{"podman preferred", "", "podman"}, {"docker fallback", "podman", "docker"}} {
+		t.Run(tt.name, func(t *testing.T) {
+			withSetupFakes(t)
+			setupLookPath = func(name string) (string, error) {
+				if name == tt.missing {
+					return "", fmt.Errorf("missing")
+				}
+				return "/fake/" + name, nil
+			}
+			used := ""
+			setupCommand = func(_ context.Context, runtimeName string, args ...string) ([]byte, error) {
+				used = runtimeName
+				return nil, fmt.Errorf("not found")
+			}
+			var out, stderr bytes.Buffer
+			if code := setupSearXNG([]string{"--config", filepath.Join(t.TempDir(), "config.yaml")}, IO{Out: &out, Err: &stderr}); code != 0 {
+				t.Fatalf("code=%d stderr=%s", code, stderr.String())
+			}
+			if used != tt.want {
+				t.Fatalf("runtime=%s want=%s", used, tt.want)
+			}
+		})
+	}
+}
+
+func TestWaitForSearXNGContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := waitForSearXNG(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestLegacyContainerWithoutLabelIsRecognized(t *testing.T) {
+	withSetupFakes(t)
+	newHome := t.TempDir()
+	path := filepath.Join(newHome, ".config", "dorker", "config.yaml")
+	settings := "/old/home/.config/dorker-searxng/settings.yml"
+	var legacy []searxContainerInspect
+	if err := json.Unmarshal(compatibleSearXNGInspect(settings, true, nil), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	legacy[0].Config.Image = "ghcr.io/searxng/searxng:latest"
+	legacyJSON, _ := json.Marshal(legacy)
+	var operations []string
+	setupCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		operations = append(operations, args[0])
+		return legacyJSON, nil
+	}
+	for run := 0; run < 2; run++ {
+		var out, stderr bytes.Buffer
+		if code := setupSearXNG([]string{"--yes", "--config", path}, IO{Out: &out, Err: &stderr}); code != 0 {
+			t.Fatalf("run=%d code=%d stderr=%s", run, code, stderr.String())
+		}
+		if strings.Contains(stderr.String(), "external") {
+			t.Fatalf("legacy container classified as external: %s", stderr.String())
+		}
+	}
+	if strings.Join(operations, ",") != "inspect,inspect" {
+		t.Fatalf("operations=%v", operations)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instances := cfg.Providers["searxng"].Instances
+	if len(instances) != 1 || instances[0].URL != "http://127.0.0.1:8080" {
+		t.Fatalf("instances=%+v", instances)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0600 {
+			t.Fatalf("mode=%v", info.Mode().Perm())
+		}
+	}
+}
+
+func TestLegacyContainerFingerprintRejectsIncompatibleContainers(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*searxContainerInspect)
+		want   string
+	}{
+		{"unrelated image", func(c *searxContainerInspect) { c.Config.Image = "example.invalid/not-searxng:latest" }, "unexpected image"},
+		{"non-loopback port", func(c *searxContainerInspect) { c.NetworkSettings.Ports["8080/tcp"][0].HostIP = "0.0.0.0" }, "does not publish only"},
+		{"incompatible settings mount", func(c *searxContainerInspect) { c.Mounts[0].Destination = "/somewhere/settings.yml" }, "not managed"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			withSetupFakes(t)
+			var containers []searxContainerInspect
+			if err := json.Unmarshal(compatibleSearXNGInspect("/old/home/settings.yml", true, nil), &containers); err != nil {
+				t.Fatal(err)
+			}
+			tt.mutate(&containers[0])
+			inspectJSON, _ := json.Marshal(containers)
+			setupCommand = func(context.Context, string, ...string) ([]byte, error) { return inspectJSON, nil }
+			var out, stderr bytes.Buffer
+			if code := setupSearXNG([]string{"--yes", "--config", filepath.Join(t.TempDir(), "config.yaml")}, IO{Out: &out, Err: &stderr}); code == 0 {
+				t.Fatal("incompatible container succeeded")
+			}
+			if !strings.Contains(stderr.String(), tt.want) {
+				t.Fatalf("stderr=%s want=%q", stderr.String(), tt.want)
+			}
+		})
+	}
+}
+
+func TestPodmanRuntimeUsesAccountHomeWhenApplicationHomeIsIsolated(t *testing.T) {
+	account, err := user.Current()
+	if err != nil || account.HomeDir == "" {
+		t.Skip("account home unavailable")
+	}
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "config"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(t.TempDir(), "data"))
+	env := containerRuntimeEnv("podman")
+	values := map[string]string{}
+	for _, item := range env {
+		parts := strings.SplitN(item, "=", 2)
+		values[parts[0]] = parts[1]
+	}
+	if values["HOME"] != account.HomeDir {
+		t.Fatalf("HOME=%q want=%q", values["HOME"], account.HomeDir)
+	}
+	if _, ok := values["XDG_CONFIG_HOME"]; ok {
+		t.Fatal("isolated XDG_CONFIG_HOME leaked to Podman")
+	}
+	if _, ok := values["XDG_DATA_HOME"]; ok {
+		t.Fatal("isolated XDG_DATA_HOME leaked to Podman")
+	}
+}
+
+func TestConfigureLocalSearXNGPreservesExistingEndpointSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	cfg := config.Default()
+	pc := cfg.Providers["searxng"]
+	pc.Instances = []config.SearXNGInstanceConfig{{Name: "custom-local", URL: "http://127.0.0.1:8080/", TokenEnv: "CUSTOM_TOKEN", RequestsPerSecond: 4, Burst: 7}}
+	cfg.Providers["searxng"] = pc
+	b, _ := yaml.Marshal(cfg)
+	if err := os.WriteFile(path, b, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := configureLocalSearXNG(path); err != nil {
+		t.Fatal(err)
+	}
+	got, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance := got.Providers["searxng"].Instances[0]
+	if instance.Name != "custom-local" || instance.TokenEnv != "CUSTOM_TOKEN" || instance.RequestsPerSecond != 4 || instance.Burst != 7 {
+		t.Fatalf("existing endpoint settings changed: %+v", instance)
 	}
 }

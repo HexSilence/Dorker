@@ -2,6 +2,7 @@ package app
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -10,10 +11,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -1401,21 +1404,47 @@ const (
 
 var (
 	setupLookPath = exec.LookPath
-	setupCommand  = func(name string, args ...string) ([]byte, error) { return exec.Command(name, args...).CombinedOutput() }
+	setupCommand  = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		cmd := exec.CommandContext(ctx, name, args...)
+		cmd.Env = containerRuntimeEnv(name)
+		return cmd.CombinedOutput()
+	}
 	setupReady    = waitForSearXNG
+	setupPortFree = searXNGPortFree
+	setupProbe    = searXNGReady
 )
 
-func waitForSearXNG() bool {
-	client := &http.Client{Timeout: 2 * time.Second}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+func containerRuntimeEnv(runtimeName string) []string {
+	environ := os.Environ()
+	if runtimeName != "podman" {
+		return environ
+	}
+	account, err := user.Current()
+	if err != nil || account.HomeDir == "" || os.Getenv("HOME") == "" || cleanAbsolutePath(os.Getenv("HOME")) == cleanAbsolutePath(account.HomeDir) {
+		return environ
+	}
+	filtered := make([]string, 0, len(environ)+1)
+	for _, item := range environ {
+		name := strings.SplitN(item, "=", 2)[0]
+		if name != "HOME" && name != "XDG_CONFIG_HOME" && name != "XDG_DATA_HOME" {
+			filtered = append(filtered, item)
+		}
+	}
+	return append(filtered, "HOME="+account.HomeDir)
+}
+
+func waitForSearXNG(ctx context.Context) error {
+	client := &http.Client{Timeout: 2 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	var lastErr error
 	for {
-		if searXNGReady(ctx, client, searxReadinessURL, searxReadinessMaxBody) == nil {
-			return true
+		if lastErr = searXNGReady(ctx, client, searxReadinessURL, searxReadinessMaxBody); lastErr == nil {
+			return nil
 		}
 		select {
 		case <-ctx.Done():
-			return false
+			return fmt.Errorf("readiness check timed out: %w (last response: %v)", ctx.Err(), lastErr)
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
@@ -1441,12 +1470,18 @@ func searXNGReady(ctx context.Context, client *http.Client, endpoint string, max
 	if int64(len(body)) > maxBody {
 		return errors.New("SearXNG readiness response is too large")
 	}
-	var object map[string]json.RawMessage
+	var object struct {
+		Results []json.RawMessage `json:"results"`
+	}
 	if err := json.Unmarshal(body, &object); err != nil {
 		return fmt.Errorf("invalid SearXNG JSON response: %w", err)
 	}
-	if object == nil {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(body, &envelope); err != nil || envelope == nil {
 		return errors.New("SearXNG JSON response is not an object")
+	}
+	if _, ok := envelope["results"]; !ok || object.Results == nil {
+		return errors.New("SearXNG JSON response has no results array")
 	}
 	return nil
 }
@@ -1454,10 +1489,22 @@ func searXNGReady(ctx context.Context, client *http.Client, endpoint string, max
 type searxContainerInspect struct {
 	Config struct {
 		Labels map[string]string `json:"Labels"`
+		Image  string            `json:"Image"`
 	} `json:"Config"`
+	State struct {
+		Running bool `json:"Running"`
+	} `json:"State"`
+	NetworkSettings struct {
+		Ports map[string][]struct {
+			HostIP   string `json:"HostIp"`
+			HostPort string `json:"HostPort"`
+		} `json:"Ports"`
+	} `json:"NetworkSettings"`
 	Mounts []struct {
+		Type        string `json:"Type"`
 		Source      string `json:"Source"`
 		Destination string `json:"Destination"`
+		RW          bool   `json:"RW"`
 	} `json:"Mounts"`
 }
 
@@ -1469,29 +1516,65 @@ func cleanAbsolutePath(path string) string {
 	return filepath.Clean(abs)
 }
 
-func inspectSearXNGContainer(runtimeName, settingsPath string) (bool, error) {
-	out, err := setupCommand(runtimeName, "inspect", searxContainer)
+func inspectSearXNGContainer(ctx context.Context, runtimeName string) (*searxContainerInspect, error) {
+	out, err := setupCommand(ctx, runtimeName, "inspect", searxContainer)
 	if err != nil {
-		return false, nil
+		lower := strings.ToLower(string(out) + " " + err.Error())
+		if strings.Contains(lower, "no such") || strings.Contains(lower, "not found") || strings.Contains(lower, "does not exist") {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("inspect %s with %s: %w", searxContainer, runtimeName, err)
 	}
 	var inspected []searxContainerInspect
 	if err := json.Unmarshal(out, &inspected); err != nil || len(inspected) != 1 {
-		return true, errors.New("cannot inspect existing dorker-searxng container configuration")
+		return nil, errors.New("cannot inspect existing dorker-searxng container configuration")
 	}
-	want := cleanAbsolutePath(settingsPath)
-	label := inspected[0].Config.Labels[searxSettingsLabel]
-	if label != "" && cleanAbsolutePath(label) != want {
-		return true, fmt.Errorf("existing dorker-searxng container belongs to settings %s; use that Dorker config or remove/rename the container manually", label)
+	c := &inspected[0]
+	label := c.Config.Labels[searxSettingsLabel]
+	bindings := c.NetworkSettings.Ports["8080/tcp"]
+	if len(c.NetworkSettings.Ports) != 1 || len(bindings) != 1 || bindings[0].HostIP != "127.0.0.1" || bindings[0].HostPort != "8080" {
+		return nil, errors.New("existing dorker-searxng container does not publish only 127.0.0.1:8080; configure its endpoint explicitly instead")
 	}
-	for _, mount := range inspected[0].Mounts {
+	if !strings.HasPrefix(c.Config.Image, "ghcr.io/searxng/searxng:") {
+		return nil, fmt.Errorf("existing dorker-searxng container uses unexpected image %s", c.Config.Image)
+	}
+	for _, mount := range c.Mounts {
 		if mount.Destination == searxSettingsTarget {
-			if cleanAbsolutePath(mount.Source) == want {
-				return true, nil
+			if mount.Type != "bind" || !filepath.IsAbs(mount.Source) || mount.RW {
+				return nil, errors.New("existing dorker-searxng container has an incompatible settings mount; configure its endpoint explicitly instead")
 			}
-			return true, fmt.Errorf("existing dorker-searxng container belongs to settings %s; use that Dorker config or remove/rename the container manually", mount.Source)
+			if label != "" && cleanAbsolutePath(label) != cleanAbsolutePath(mount.Source) {
+				return nil, errors.New("existing dorker-searxng container has inconsistent Dorker ownership metadata; configure its endpoint explicitly instead")
+			}
+			return c, nil
 		}
 	}
-	return true, errors.New("existing dorker-searxng container is not managed by this Dorker config; rename it or use a separately configured SearXNG URL")
+	return nil, errors.New("existing dorker-searxng container is not managed by this Dorker config; rename it or use a separately configured SearXNG URL")
+}
+
+func searXNGPortFree() bool {
+	listener, err := net.Listen("tcp", "127.0.0.1:8080")
+	if err != nil {
+		return false
+	}
+	_ = listener.Close()
+	return true
+}
+
+func setupRuntimeError(out []byte, err error) error {
+	detail := strings.TrimSpace(string(out))
+	lower := strings.ToLower(detail + " " + err.Error())
+	if strings.Contains(lower, "address already in use") || strings.Contains(lower, "port is already allocated") || strings.Contains(lower, "bind: address") {
+		return errors.New("port 127.0.0.1:8080 became unavailable while starting SearXNG; inspect dorker-searxng before retrying")
+	}
+	if detail == "" {
+		return fmt.Errorf("start SearXNG: %w", err)
+	}
+	const limit = 500
+	if len(detail) > limit {
+		detail = detail[len(detail)-limit:]
+	}
+	return fmt.Errorf("start SearXNG: %s", detail)
 }
 
 func setupSearXNG(args []string, ioo IO) int {
@@ -1516,15 +1599,52 @@ func setupSearXNG(args []string, ioo IO) int {
 		fmt.Fprintln(ioo.Err, containerRuntimeGuidance(runtime.GOOS))
 		return 3
 	}
-	if !*yes {
-		fmt.Fprintf(ioo.Out, "This creates dorker-searxng, binds only 127.0.0.1:8080, and uses %s.\nRun again with --yes to confirm.\n", searxImage)
-		return 0
-	}
+	ctx := context.Background()
 	base := filepath.Join(filepath.Dir(config.ExpandPath(*configPath)), "searxng")
 	settingsPath := filepath.Join(base, "settings.yml")
-	exists, err := inspectSearXNGContainer(runtimeName, settingsPath)
+	container, err := inspectSearXNGContainer(ctx, runtimeName)
 	if err != nil {
 		return fail(ioo.Err, 1, err)
+	}
+	fmt.Fprintln(ioo.Out, "DORKER / SETUP SEARXNG")
+	if container != nil {
+		if !container.State.Running {
+			if !*yes {
+				fmt.Fprintf(ioo.Out, "\n  Container      Stopped · %s\n  Endpoint       Configured · http://127.0.0.1:8080\n\nRun again with --yes to start the existing compatible container.\n", searxContainer)
+				return 0
+			}
+			if !setupPortFree() {
+				return fail(ioo.Err, 1, errors.New("port 127.0.0.1:8080 is already in use; the stopped dorker-searxng container cannot be started until the unrelated listener is stopped"))
+			}
+			out, startErr := setupCommand(ctx, runtimeName, "start", searxContainer)
+			if startErr != nil {
+				return fail(ioo.Err, 1, setupRuntimeError(out, startErr))
+			}
+		}
+		if err := setupReady(ctx); err != nil {
+			return fail(ioo.Err, 1, fmt.Errorf("container %s at http://127.0.0.1:8080 is not ready: %w", searxContainer, err))
+		}
+		if !*yes {
+			fmt.Fprintf(ioo.Out, "\n  Container      Ready · %s\n  Endpoint       Ready · http://127.0.0.1:8080\n  SearXNG        Ready\n\nLocal SearXNG is already configured and running.\n", searxContainer)
+			return 0
+		}
+		if err := configureLocalSearXNG(*configPath); err != nil {
+			return fail(ioo.Err, 1, err)
+		}
+		fmt.Fprintf(ioo.Out, "\n  Container      Ready · %s\n  Endpoint       Ready · http://127.0.0.1:8080\n  SearXNG        Ready\n\nLocal SearXNG is already configured and running.\n", searxContainer)
+		return 0
+	}
+
+	if !setupPortFree() {
+		client := &http.Client{Timeout: 2 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+		if healthErr := setupProbe(ctx, client, searxReadinessURL, searxReadinessMaxBody); healthErr == nil {
+			return fail(ioo.Err, 1, errors.New("a healthy external SearXNG is already running at http://127.0.0.1:8080; Dorker will not take ownership of it\nset SEARXNG_URL=http://127.0.0.1:8080 or add that endpoint to your config"))
+		}
+		return fail(ioo.Err, 1, errors.New("port 127.0.0.1:8080 is already in use by another service\nfree the port and run `dorker setup searxng --yes`, or configure an existing SearXNG with SEARXNG_URL"))
+	}
+	if !*yes {
+		fmt.Fprintf(ioo.Out, "\n  Container      Will create · %s\n  Endpoint       Available · http://127.0.0.1:8080\n  Image          %s\n\nRun again with --yes to confirm.\n", searxContainer, searxImage)
+		return 0
 	}
 	if err := os.MkdirAll(base, 0700); err != nil {
 		return fail(ioo.Err, 1, err)
@@ -1545,21 +1665,24 @@ func setupSearXNG(args []string, ioo IO) int {
 	if runtimeName == "podman" {
 		mount += ",Z"
 	}
-	var out []byte
-	if exists {
-		out, err = setupCommand(runtimeName, "start", searxContainer)
-	} else {
-		out, err = setupCommand(runtimeName, "run", "-d", "--name", searxContainer, "--label", searxSettingsLabel+"="+cleanAbsolutePath(settingsPath), "--restart", "unless-stopped", "-p", "127.0.0.1:8080:8080", "-v", mount, searxImage)
-	}
+	out, err := setupCommand(ctx, runtimeName, "run", "-d", "--name", searxContainer, "--label", searxSettingsLabel+"="+cleanAbsolutePath(settingsPath), "--restart", "unless-stopped", "-p", "127.0.0.1:8080:8080", "-v", mount, searxImage)
 	if err != nil {
-		return fail(ioo.Err, 1, fmt.Errorf("start SearXNG: %s", strings.TrimSpace(string(out))))
+		return fail(ioo.Err, 1, setupRuntimeError(out, err))
 	}
-	if !setupReady() {
-		return fail(ioo.Err, 1, errors.New("SearXNG started but did not become ready within 30 seconds"))
+	if err := setupReady(ctx); err != nil {
+		return fail(ioo.Err, 1, fmt.Errorf("container %s at http://127.0.0.1:8080 is not ready: %w", searxContainer, err))
 	}
-	cfg, err := config.Load(*configPath)
-	if err != nil {
+	if err := configureLocalSearXNG(*configPath); err != nil {
 		return fail(ioo.Err, 1, err)
+	}
+	fmt.Fprintf(ioo.Out, "\n  Container      Ready · %s\n  Endpoint       Ready · http://127.0.0.1:8080\n  SearXNG        Ready\n\nLocal SearXNG is configured and running with %s.\n", searxContainer, runtimeName)
+	return 0
+}
+
+func configureLocalSearXNG(configPath string) error {
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return err
 	}
 	pc := cfg.Providers["searxng"]
 	pc.Enabled = true
@@ -1570,8 +1693,6 @@ func setupSearXNG(args []string, ioo IO) int {
 	found := false
 	for i := range pc.Instances {
 		if strings.TrimRight(pc.Instances[i].URL, "/") == managed.URL {
-			managed.Name = pc.Instances[i].Name
-			pc.Instances[i] = managed
 			found = true
 			break
 		}
@@ -1592,17 +1713,19 @@ func setupSearXNG(args []string, ioo IO) int {
 	cfg.Providers["searxng"] = pc
 	b, err := yaml.Marshal(cfg)
 	if err != nil {
-		return fail(ioo.Err, 1, err)
+		return err
 	}
-	path := config.ExpandPath(*configPath)
+	path := config.ExpandPath(configPath)
 	if err = os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return fail(ioo.Err, 1, err)
+		return err
+	}
+	if existing, readErr := os.ReadFile(path); readErr == nil && bytes.Equal(existing, b) {
+		return nil
 	}
 	if err = writeFileAtomic(path, b, 0600); err != nil {
-		return fail(ioo.Err, 1, err)
+		return err
 	}
-	fmt.Fprintf(ioo.Out, "SearXNG is ready.\n\n  URL      http://127.0.0.1:8080\n  Runtime  %s\n  Config   %s\n", runtimeName, settingsPath)
-	return 0
+	return nil
 }
 
 func containerRuntimeGuidance(goos string) string {

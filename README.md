@@ -103,9 +103,9 @@ GHDB is bundled in the binary; no source-tree files are needed at runtime. Searc
 
 ## SearXNG
 
-Dorker can use an existing SearXNG JSON API through `SEARXNG_URL` or configured instances. Guided local setup prefers Podman, falls back to Docker, binds only `127.0.0.1:8080`, generates a private settings secret, waits for valid JSON, and changes Dorker config only after readiness succeeds.
+Dorker can use an external SearXNG JSON API through `SEARXNG_URL` or configured instances. Guided local setup prefers Podman, falls back to Docker, binds only `127.0.0.1:8080`, generates a private settings secret, waits for valid JSON, and changes Dorker config only after readiness succeeds. Setup is idempotent: it reuses an existing compatible `dorker-searxng` container, starting it when stopped, without recreating it.
 
-The image is digest-pinned. Setup will not install a runtime, use sudo/admin access, replace an unrelated container, or remount a container owned by another Dorker config.
+The image is digest-pinned. Setup will not install a runtime, use sudo/admin access, replace an unrelated container, or remount an existing compatible Dorker container.
 
 ## Output
 
