@@ -938,8 +938,19 @@ func runSearch(args []string, ioo IO, resumeID string, resuming bool, origin sea
 	if finalProgress, e := st.LoadProgress(cleanupCtx, job); e == nil {
 		for _, p := range finalProgress {
 			switch p.State {
+			case "COMPLETE":
+				if report.SaturationReason == "" && (p.ExhaustedReason == "maximum page limit reached" || p.ExhaustedReason == "result limit reached") {
+					report.SaturationReason = p.ExhaustedReason
+				}
 			case "SATURATED":
 				report.Saturated = true
+				if report.SaturationReason == "" {
+					report.SaturationReason = p.ExhaustedReason
+				}
+			case "DEGRADED_COMPLETE":
+				report.Degraded = true
+				report.Partial = true
+				report.DegradedEarlyStop = true
 				if report.SaturationReason == "" {
 					report.SaturationReason = p.ExhaustedReason
 				}

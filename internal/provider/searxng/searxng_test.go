@@ -75,6 +75,54 @@ func TestSearchJSONQueryPaginationAndProvenance(t *testing.T) {
 	}
 }
 
+func TestSequentialOneBasedPaginationAndShortPages(t *testing.T) {
+	var pages []string
+	c, server := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := r.URL.Query().Get("pageno")
+		pages = append(pages, page)
+		if r.URL.Query().Has("page_size") || r.URL.Query().Has("pagesize") {
+			t.Fatalf("unsupported page-size parameter sent: %s", r.URL.RawQuery)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch page {
+		case "1":
+			fmt.Fprint(w, `{"results":[{"url":"https://example.com/a"},{"url":"https://example.com/b"}]}`)
+		case "2":
+			fmt.Fprint(w, `{"results":[{"url":"https://example.com/c"}]}`)
+		case "3":
+			fmt.Fprint(w, `{"results":[{"url":"https://example.com/d"},{"url":"https://example.com/e"}]}`)
+		default:
+			fmt.Fprint(w, `{"results":[]}`)
+		}
+	}), nil)
+	defer server.Close()
+
+	var urls []string
+	for page := 0; page < 4; page++ {
+		request := provider.SearchRequest{Query: "site:example.com", Page: page, PageSize: 100}
+		info := c.Pagination(request)
+		if info.UpstreamPage != page+1 || info.PageSizeApplied {
+			t.Fatalf("page %d info=%+v", page, info)
+		}
+		response, err := c.Search(context.Background(), request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, result := range response.Results {
+			urls = append(urls, result.URL)
+		}
+		if response.Done != (page == 3) {
+			t.Fatalf("page %d done=%v", page, response.Done)
+		}
+	}
+	if got := strings.Join(pages, ","); got != "1,2,3,4" {
+		t.Fatalf("pageno sequence=%s", got)
+	}
+	if got := strings.Join(urls, ","); got != "https://example.com/a,https://example.com/b,https://example.com/c,https://example.com/d,https://example.com/e" {
+		t.Fatalf("urls=%s", got)
+	}
+}
+
 func TestMissingOptionalFields(t *testing.T) {
 	c, s := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -320,6 +368,32 @@ func TestClusterCoverageAcceptsHealthyEmptyResponses(t *testing.T) {
 	out, err := cluster.Search(context.Background(), provider.SearchRequest{Query: "x"})
 	if err != nil || len(out.Results) != 0 || !out.Done {
 		t.Fatalf("out=%+v err=%v", out, err)
+	}
+}
+
+func TestClusterCoverageDoneRequiresEverySuccessfulInstance(t *testing.T) {
+	a, as := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"results":[]}`)
+	}), nil)
+	defer as.Close()
+	b, bs := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("pageno") == "1" {
+			fmt.Fprint(w, `{"results":[{"url":"https://example.com/later"}]}`)
+			return
+		}
+		fmt.Fprint(w, `{"results":[]}`)
+	}), func(o *Options) { o.Name = "secondary" })
+	defer bs.Close()
+	cluster, _ := NewCluster([]*Client{a, b}, "coverage")
+	first, err := cluster.Search(context.Background(), provider.SearchRequest{Query: "x", Page: 0})
+	if err != nil || first.Done || len(first.Results) != 1 {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	second, err := cluster.Search(context.Background(), provider.SearchRequest{Query: "x", Page: 1})
+	if err != nil || !second.Done || len(second.Results) != 0 {
+		t.Fatalf("second=%+v err=%v", second, err)
 	}
 }
 

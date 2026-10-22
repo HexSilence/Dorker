@@ -1,10 +1,12 @@
 package scheduler
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -29,6 +31,9 @@ type sequenceProvider struct {
 func (p *sequenceProvider) Name() string { return p.name }
 func (p *sequenceProvider) Health() provider.HealthStatus {
 	return provider.HealthStatus{State: provider.Ready}
+}
+func (p *sequenceProvider) Pagination(r provider.SearchRequest) provider.PaginationInfo {
+	return provider.PaginationInfo{UpstreamPage: r.Page + 1}
 }
 func (p *sequenceProvider) Search(context.Context, provider.SearchRequest) (provider.SearchResponse, error) {
 	p.mu.Lock()
@@ -135,6 +140,108 @@ func TestDuplicateOnlySaturatesButDegradedEmptyDoesNot(t *testing.T) {
 			t.Fatalf("%+v", progress[0])
 		}
 	})
+}
+
+func TestDegradedDuplicateStreakUsesLowerConfidenceStop(t *testing.T) {
+	st, col, vs := adaptiveFixture(t)
+	r := model.Result{URL: "https://example.test/a", Provider: "searxng", DiscoveredAt: time.Now()}
+	degraded := []provider.UpstreamDiagnostic{{Provider: "searxng", Engine: "brave", Classification: provider.UpstreamRateLimited}}
+	p := &sequenceProvider{name: "searxng", responses: []provider.SearchResponse{
+		{Results: []model.Result{r}, Diagnostics: degraded},
+		{Results: []model.Result{r}, Diagnostics: degraded},
+		{Results: []model.Result{r}, Diagnostics: degraded},
+		{Results: []model.Result{{URL: "https://example.test/later", Provider: "searxng", DiscoveredAt: time.Now()}}, Diagnostics: degraded},
+		{Results: []model.Result{r}, Diagnostics: degraded},
+		{Results: []model.Result{r}, Diagnostics: degraded},
+		{Results: []model.Result{r}, Diagnostics: degraded},
+		{Results: []model.Result{r}, Diagnostics: degraded},
+	}}
+	s := New(st, col, slog.New(slog.NewTextHandler(io.Discard, nil)), Options{Workers: 1, MaxPages: 20, PageSize: 100, SaturationEnabled: true, ConsecutiveZeroYieldPages: 2, Retry: rl.RetryPolicy{MaxAttempts: 1}})
+	if err := s.Run(context.Background(), "job", vs, []Runtime{NewRuntime(p, 1000, 1)}, nil); err != nil {
+		t.Fatal(err)
+	}
+	report := s.Report()
+	if p.calls != 8 || col.Unique.Load() != 2 || report.Saturated || !report.DegradedEarlyStop || !report.Partial {
+		t.Fatalf("calls=%d unique=%d report=%+v", p.calls, col.Unique.Load(), report)
+	}
+	progress, err := st.LoadProgress(context.Background(), "job")
+	if err != nil || len(progress) != 1 || progress[0].State != "DEGRADED_COMPLETE" {
+		t.Fatalf("progress=%+v err=%v", progress, err)
+	}
+	resumed := New(st, col, slog.New(slog.NewTextHandler(io.Discard, nil)), Options{Workers: 1, MaxPages: 20, PageSize: 100, SaturationEnabled: true, ConsecutiveZeroYieldPages: 2, Retry: rl.RetryPolicy{MaxAttempts: 1}})
+	if err = resumed.Run(context.Background(), "job", vs, []Runtime{NewRuntime(p, 1000, 1)}, progress); err != nil {
+		t.Fatal(err)
+	}
+	if p.calls != 8 {
+		t.Fatalf("completed degraded task reran on resume: calls=%d", p.calls)
+	}
+}
+
+func TestHealthyDuplicateThresholdRemainsAdaptive(t *testing.T) {
+	st, col, vs := adaptiveFixture(t)
+	r := model.Result{URL: "https://example.test/a", Provider: "p", DiscoveredAt: time.Now()}
+	p := &sequenceProvider{name: "p", responses: []provider.SearchResponse{
+		{Results: []model.Result{r}},
+		{Results: []model.Result{r}},
+		{Results: []model.Result{r}},
+		{Results: []model.Result{{URL: "https://example.test/later", Provider: "p", DiscoveredAt: time.Now()}}, Done: true},
+	}}
+	s := New(st, col, slog.New(slog.NewTextHandler(io.Discard, nil)), Options{Workers: 1, MaxPages: 10, PageSize: 10, SaturationEnabled: true, ConsecutiveZeroYieldPages: 2, Retry: rl.RetryPolicy{MaxAttempts: 1}})
+	if err := s.Run(context.Background(), "job", vs, []Runtime{NewRuntime(p, 1000, 1)}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if p.calls != 3 || !s.Report().Saturated || col.Unique.Load() != 1 {
+		t.Fatalf("calls=%d unique=%d report=%+v", p.calls, col.Unique.Load(), s.Report())
+	}
+}
+
+func TestMaxPagesIsHardCeiling(t *testing.T) {
+	st, col, vs := adaptiveFixture(t)
+	p := &sequenceProvider{name: "p", responses: []provider.SearchResponse{
+		{Results: []model.Result{{URL: "https://example.test/a", Provider: "p", DiscoveredAt: time.Now()}}},
+		{Results: []model.Result{{URL: "https://example.test/b", Provider: "p", DiscoveredAt: time.Now()}}},
+		{Results: []model.Result{{URL: "https://example.test/c", Provider: "p", DiscoveredAt: time.Now()}}},
+	}}
+	s := New(st, col, slog.New(slog.NewTextHandler(io.Discard, nil)), Options{Workers: 1, MaxPages: 2, PageSize: 10, SaturationEnabled: false, Retry: rl.RetryPolicy{MaxAttempts: 1}})
+	if err := s.Run(context.Background(), "job", vs, []Runtime{NewRuntime(p, 1000, 1)}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if p.calls != 2 || col.Unique.Load() != 2 || s.Report().SaturationReason != "maximum page limit reached" {
+		t.Fatalf("calls=%d unique=%d report=%+v", p.calls, col.Unique.Load(), s.Report())
+	}
+}
+
+func TestMaxResultsHasDistinctStopReason(t *testing.T) {
+	st, col, vs := adaptiveFixture(t)
+	p := &sequenceProvider{name: "p", responses: []provider.SearchResponse{{Results: []model.Result{
+		{URL: "https://example.test/a", Provider: "p", DiscoveredAt: time.Now()},
+		{URL: "https://example.test/b", Provider: "p", DiscoveredAt: time.Now()},
+		{URL: "https://example.test/c", Provider: "p", DiscoveredAt: time.Now()},
+	}}}}
+	s := New(st, col, slog.New(slog.NewTextHandler(io.Discard, nil)), Options{Workers: 1, MaxPages: 10, MaxResults: 2, MaxResultsPerQuery: 10, PageSize: 10, Retry: rl.RetryPolicy{MaxAttempts: 1}})
+	if err := s.Run(context.Background(), "job", vs, []Runtime{NewRuntime(p, 1000, 1)}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if p.calls != 1 || col.Unique.Load() != 2 || s.Report().SaturationReason != "result limit reached" {
+		t.Fatalf("calls=%d unique=%d report=%+v", p.calls, col.Unique.Load(), s.Report())
+	}
+}
+
+func TestDebugPageDiagnosticsExposePaginationAndYield(t *testing.T) {
+	st, col, vs := adaptiveFixture(t)
+	p := &sequenceProvider{name: "p", responses: []provider.SearchResponse{{Results: []model.Result{{URL: "https://example.test/a", Provider: "p", DiscoveredAt: time.Now()}}, Done: true}}}
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	s := New(st, col, logger, Options{Workers: 1, MaxPages: 2, PageSize: 100, Retry: rl.RetryPolicy{MaxAttempts: 1}})
+	if err := s.Run(context.Background(), "job", vs, []Runtime{NewRuntime(p, 1000, 1)}, nil); err != nil {
+		t.Fatal(err)
+	}
+	text := logs.String()
+	for _, want := range []string{"logical_page=0", "upstream_page=1", "requested_page_size=100", `msg="provider page processed"`, "raw=1", "accepted=1", "new_unique=1", "outcome=USEFUL_PAGE", "provider_done=true", "coverage=trustworthy"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing %q in logs:\n%s", want, text)
+		}
+	}
 }
 
 func TestUsefulPageWithSourceDegradationRemainsDegraded(t *testing.T) {

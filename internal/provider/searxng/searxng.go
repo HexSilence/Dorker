@@ -110,6 +110,9 @@ func (c *Client) Health() provider.HealthStatus { return c.health.Snapshot() }
 func (c *Client) Capabilities() provider.Capabilities {
 	return provider.Capabilities{SupportsPagination: true}
 }
+func (c *Client) Pagination(r provider.SearchRequest) provider.PaginationInfo {
+	return provider.PaginationInfo{UpstreamPage: r.Page + 1, PageSizeApplied: false}
+}
 
 func (c *Client) Search(ctx context.Context, r provider.SearchRequest) (out provider.SearchResponse, err error) {
 	started := time.Now()
@@ -256,6 +259,9 @@ func NewCluster(instances []*Client, strategy string) (*Cluster, error) {
 func (c *Cluster) Name() string { return "searxng" }
 func (c *Cluster) Capabilities() provider.Capabilities {
 	return provider.Capabilities{SupportsPagination: true}
+}
+func (c *Cluster) Pagination(r provider.SearchRequest) provider.PaginationInfo {
+	return provider.PaginationInfo{UpstreamPage: r.Page + 1, PageSizeApplied: false}
 }
 func (c *Cluster) Instances() []*Client { return append([]*Client(nil), c.instances...) }
 func (c *Cluster) Health() provider.HealthStatus {

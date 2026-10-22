@@ -56,7 +56,7 @@ const (
 type Report struct {
 	UsefulPages, CleanEmptyPages, DegradedEmptyPages, DuplicateOnlyPages, RejectedOnlyPages, ErrorPages int
 	ProviderFailures                                                                                    int
-	Saturated, Degraded, Partial                                                                        bool
+	Saturated, Degraded, Partial, DegradedEarlyStop                                                     bool
 	SaturationReason                                                                                    string
 }
 type task struct {
@@ -92,6 +92,11 @@ func (s *Scheduler) record(outcome PageOutcome) {
 		s.report.ErrorPages++
 		s.report.Degraded = true
 	}
+}
+func (s *Scheduler) setStopReason(reason string) {
+	s.reportMu.Lock()
+	s.report.SaturationReason = reason
+	s.reportMu.Unlock()
 }
 func ClassifyPage(resp provider.SearchResponse, marginalUnique, accepted int, err error) PageOutcome {
 	if err != nil {
@@ -166,7 +171,7 @@ enqueue:
 			}
 			key := rt.Provider.Name() + "\x00" + v.Variant
 			p, ok := saved[key]
-			if ok && (p.State == "COMPLETE" || p.State == "SATURATED") {
+			if ok && (p.State == "COMPLETE" || p.State == "SATURATED" || p.State == "DEGRADED_COMPLETE") {
 				continue
 			}
 			if !ok {
@@ -208,10 +213,14 @@ func (s *Scheduler) runTask(ctx context.Context, job string, t task) error {
 	for {
 		if s.Options.MaxPages > 0 && p.Page >= s.Options.MaxPages {
 			p.State = "COMPLETE"
+			p.ExhaustedReason = "maximum page limit reached"
+			s.setStopReason(p.ExhaustedReason)
 			return s.Store.SaveProgress(ctx, p)
 		}
 		if s.limitReached(t.v.Original) {
 			p.State = "COMPLETE"
+			p.ExhaustedReason = "result limit reached"
+			s.setStopReason(p.ExhaustedReason)
 			return s.Store.SaveProgress(ctx, p)
 		}
 		if err := t.rt.Limiter.Wait(ctx); err != nil {
@@ -219,12 +228,23 @@ func (s *Scheduler) runTask(ctx context.Context, job string, t task) error {
 		}
 		req := provider.SearchRequest{Query: t.v.Variant, OriginalQuery: t.v.Original, Cursor: p.Cursor, Page: p.Page, PageSize: s.Options.PageSize}
 		started := time.Now()
-		s.Log.Debug("provider request", "provider", p.Provider, "page", p.Page, "cursor", p.Cursor)
+		requestAttrs := []any{"provider", p.Provider, "logical_page", p.Page, "cursor", p.Cursor, "requested_page_size", req.PageSize}
+		var pagination provider.PaginationInfo
+		hasPagination := false
+		if describer, ok := t.rt.Provider.(provider.PaginationDescriber); ok {
+			pagination, hasPagination = describer.Pagination(req), true
+			requestAttrs = append(requestAttrs, "upstream_page", pagination.UpstreamPage, "page_size_applied", pagination.PageSizeApplied)
+		}
+		s.Log.Debug("provider request", requestAttrs...)
 		resp, err := t.rt.Provider.Search(ctx, req)
 		if err != nil {
 			s.record(ErrorPage)
 			status := responseStatus(err)
-			s.Log.Debug("provider response", "provider", p.Provider, "duration", time.Since(started), "http_status", status, "response_received", status != 0, "page", p.Page, "cursor", p.Cursor, "results", 0, "retry_classification", provider.KindOf(err), "error", err.Error())
+			responseAttrs := []any{"provider", p.Provider, "duration", time.Since(started), "http_status", status, "response_received", status != 0, "logical_page", p.Page, "cursor", p.Cursor, "results", 0, "retry_classification", provider.KindOf(err), "error", err.Error()}
+			if hasPagination {
+				responseAttrs = append(responseAttrs, "upstream_page", pagination.UpstreamPage)
+			}
+			s.Log.Debug("provider response", responseAttrs...)
 			p.Attempts++
 			p.LastError = err.Error()
 			kind := provider.KindOf(err)
@@ -277,7 +297,11 @@ func (s *Scheduler) runTask(ctx context.Context, job string, t task) error {
 			p.State = "READY"
 			continue
 		}
-		s.Log.Debug("provider response", "provider", p.Provider, "duration", resp.Duration, "http_status", resp.HTTPStatus, "page", p.Page, "cursor", p.Cursor, "results", len(resp.Results), "retry_classification", "none")
+		responseAttrs := []any{"provider", p.Provider, "duration", resp.Duration, "http_status", resp.HTTPStatus, "logical_page", p.Page, "cursor", p.Cursor, "results", len(resp.Results), "retry_classification", "none"}
+		if hasPagination {
+			responseAttrs = append(responseAttrs, "upstream_page", pagination.UpstreamPage)
+		}
+		s.Log.Debug("provider response", responseAttrs...)
 		for _, partial := range resp.PartialErrors {
 			s.reportMu.Lock()
 			s.report.Degraded = true
@@ -308,7 +332,7 @@ func (s *Scheduler) runTask(ctx context.Context, job string, t task) error {
 		s.collectMu.Lock()
 		rawBefore, acceptedBefore := s.Collector.Raw.Load(), s.Collector.Accepted.Load()
 		rejectedBefore, unknownBefore := s.Collector.Rejected.Load(), s.Collector.UnknownKept.Load()
-		duplicatesBefore := s.Collector.Duplicates.Load()
+		duplicatesBefore, malformedBefore := s.Collector.Duplicates.Load(), s.Collector.Malformed.Load()
 		batch := resp.Results
 		if remaining := s.remaining(t.v.Original); remaining >= 0 && len(batch) > remaining {
 			batch = batch[:remaining]
@@ -329,6 +353,7 @@ func (s *Scheduler) runTask(ctx context.Context, job string, t task) error {
 		rejectedDelta := int(s.Collector.Rejected.Load() - rejectedBefore)
 		unknownDelta := int(s.Collector.UnknownKept.Load() - unknownBefore)
 		duplicateDelta := int(s.Collector.Duplicates.Load() - duplicatesBefore)
+		malformedDelta := int(s.Collector.Malformed.Load() - malformedBefore)
 		s.collectMu.Unlock()
 		outcome := ClassifyPage(resp, fresh, acceptedDelta, nil)
 		s.record(outcome)
@@ -352,24 +377,52 @@ func (s *Scheduler) runTask(ctx context.Context, job string, t task) error {
 			s.reportMu.Lock()
 			s.report.Partial = true
 			s.reportMu.Unlock()
-		} else if resp.Done || outcome == CleanEmpty || s.limitReached(t.v.Original) {
+		} else if resp.Done || outcome == CleanEmpty {
 			p.State = "COMPLETE"
 			p.ExhaustedReason = "provider exhausted"
+		} else if s.limitReached(t.v.Original) {
+			p.State = "COMPLETE"
+			p.ExhaustedReason = "result limit reached"
+			s.setStopReason(p.ExhaustedReason)
 		} else if capable, ok := t.rt.Provider.(provider.Capable); ok && (!capable.Capabilities().SupportsPagination || (capable.Capabilities().MaximumAccessibleResults > 0 && p.Page*s.Options.PageSize >= capable.Capabilities().MaximumAccessibleResults)) {
 			p.State = "COMPLETE"
 			p.ExhaustedReason = "provider pagination ceiling reached"
-		} else if s.Options.SaturationEnabled && p.ZeroYieldStreak >= s.Options.ConsecutiveZeroYieldPages {
-			p.State = "SATURATED"
-			p.ExhaustedReason = "duplicate/zero-yield threshold reached"
+		} else if s.Options.SaturationEnabled {
 			s.reportMu.Lock()
-			s.report.Saturated = true
-			s.report.SaturationReason = p.ExhaustedReason
+			degraded := s.report.Degraded
+			threshold := s.Options.ConsecutiveZeroYieldPages
+			if degraded {
+				// Incomplete upstream coverage lowers confidence in a zero-yield
+				// streak. Require twice the normal evidence, while retaining hard
+				// page/result limits so degraded searches remain bounded.
+				threshold *= 2
+			}
+			if p.ZeroYieldStreak >= threshold {
+				if degraded {
+					p.State = "DEGRADED_COMPLETE"
+					p.ExhaustedReason = "low-yield threshold reached under degraded upstream coverage"
+					s.report.Partial = true
+					s.report.DegradedEarlyStop = true
+				} else {
+					p.State = "SATURATED"
+					p.ExhaustedReason = "duplicate/zero-yield threshold reached"
+					s.report.Saturated = true
+				}
+				s.report.SaturationReason = p.ExhaustedReason
+			}
 			s.reportMu.Unlock()
 		}
+		degraded := s.Report().Degraded
+		pageAttrs := []any{"provider", p.Provider, "logical_page", req.Page}
+		if hasPagination {
+			pageAttrs = append(pageAttrs, "upstream_page", pagination.UpstreamPage)
+		}
+		pageAttrs = append(pageAttrs, "raw", rawDelta, "normalized", rawDelta-malformedDelta, "accepted", acceptedDelta, "rejected", rejectedDelta, "malformed", malformedDelta, "duplicates", duplicateDelta, "new_unique", fresh, "outcome", outcome, "zero_yield_streak", p.ZeroYieldStreak, "provider_done", resp.Done, "coverage", map[bool]string{true: "degraded", false: "trustworthy"}[degraded], "degraded", degraded, "state", p.State)
+		s.Log.Debug("provider page processed", pageAttrs...)
 		if e := s.Store.SaveProgress(ctx, p); e != nil {
 			return e
 		}
-		if p.State == "COMPLETE" || p.State == "SATURATED" || p.State == "DEGRADED" {
+		if p.State == "COMPLETE" || p.State == "SATURATED" || p.State == "DEGRADED" || p.State == "DEGRADED_COMPLETE" {
 			return nil
 		}
 	}

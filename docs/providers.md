@@ -14,6 +14,8 @@ dorker providers test searxng
 
 For a search that explicitly selects SearXNG engines, use `--provider searxng --searxng-engines engine1,engine2`. Values are trimmed, case-normalized, and deduplicated. `--searxng-strategy balanced` selects one healthy configured instance with failover; `coverage` queries every usable configured instance and merges their results. These SearXNG-only options are rejected when SearXNG is not selected.
 
+Dorker's logical page zero maps to SearXNG `pageno=1`, and later logical pages advance sequentially. SearXNG does not expose a portable result-count parameter, so `--page-size` is not sent to SearXNG and a short non-empty response does not prove exhaustion. An empty response does. Repeated pages can still trigger adaptive early stopping; when SearXNG simultaneously reports degraded upstream engines, Dorker requires additional low-yield evidence and reports the stop as partial degraded coverage rather than trustworthy saturation. `--max-pages` remains a hard ceiling, not a required request count.
+
 ## Brave Search API
 
 Create an API credential through Brave Search and expose it to Dorker without writing it into example configuration:

@@ -198,6 +198,19 @@ type Capabilities struct {
 }
 
 type Capable interface{ Capabilities() Capabilities }
+
+// PaginationInfo describes how a provider maps Dorker's zero-based logical
+// pages to its upstream API. It is diagnostic only and must not affect search
+// behavior.
+type PaginationInfo struct {
+	UpstreamPage    int
+	PageSizeApplied bool
+}
+
+type PaginationDescriber interface {
+	Pagination(SearchRequest) PaginationInfo
+}
+
 type Provider interface {
 	Name() string
 	Search(context.Context, SearchRequest) (SearchResponse, error)
