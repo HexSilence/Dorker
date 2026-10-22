@@ -1,14 +1,39 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"errors"
+	"io"
 	"net"
+	"net/http"
 	"syscall"
 	"testing"
 	"time"
 )
+
+func TestDecodeJSONResponsePreservesReceivedHTTPStatus(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		max  int64
+	}{
+		{"malformed", `{"results":[`, 1024},
+		{"oversized", `{"padding":"too large"}`, 4},
+		{"html", `<html>not JSON</html>`, 1024},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewBufferString(tt.body))}
+			err := DecodeJSONResponse(resp, tt.max, &map[string]any{})
+			var pe *Error
+			if !errors.As(err, &pe) || pe.HTTPStatus != http.StatusOK {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+}
 
 func TestTransportErrorClassification(t *testing.T) {
 	tests := []struct {

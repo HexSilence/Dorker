@@ -83,6 +83,17 @@ func runDiscover(args []string, ioo IO, resumeID string, resuming bool) int {
 	if fs.NArg() != 0 {
 		return fail(ioo.Err, 2, fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " ")))
 	}
+	explicitMaxDepth, explicitSaturationThreshold := false, false
+	fs.Visit(func(f *flag.Flag) {
+		explicitMaxDepth = explicitMaxDepth || f.Name == "max-depth"
+		explicitSaturationThreshold = explicitSaturationThreshold || f.Name == "saturation-threshold"
+	})
+	if explicitMaxDepth && o.MaxDepth < 0 {
+		return fail(ioo.Err, 2, errors.New("max-depth cannot be negative"))
+	}
+	if explicitSaturationThreshold && o.SaturationThreshold < 0 {
+		return fail(ioo.Err, 2, errors.New("saturation-threshold cannot be negative"))
+	}
 	cfg, err := config.Load(o.Config)
 	if err != nil {
 		return fail(ioo.Err, 2, err)
@@ -145,6 +156,9 @@ func runDiscover(args []string, ioo IO, resumeID string, resuming bool) int {
 		if len(c.Sites) == 0 {
 			return fail(ioo.Err, 2, errors.New("discover requires a positive site: scope"))
 		}
+	}
+	if _, err = logging.New(io.Discard, o.LogLevel); err != nil {
+		return fail(ioo.Err, 2, err)
 	}
 	dopts := discovery.Options{MaxDepth: o.MaxDepth, MaxHosts: o.MaxHosts, MaxQueries: o.MaxQueries, MaxResults: o.MaxResults, MaxResultsPerQuery: o.MaxPerQuery, MaxPages: o.MaxPages, MaxDuration: o.MaxDuration, SaturationThreshold: o.SaturationThreshold, SaturationConsecutiveDepths: o.SaturationDepths, MinSaturationDepths: 2}
 	if err = dopts.Validate(); err != nil {

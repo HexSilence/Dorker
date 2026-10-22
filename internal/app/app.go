@@ -114,6 +114,9 @@ func runCLI(args []string, streams IO) int {
 		return 0
 	}
 	if args[0] == "--version" {
+		if len(args) != 1 {
+			return fail(streams.Err, 2, errors.New("--version takes no arguments"))
+		}
 		fmt.Fprintln(streams.Out, buildinfo.String())
 		return 0
 	}
@@ -182,6 +185,9 @@ func runCLI(args []string, streams IO) int {
 	case "query":
 		return runQuery(args, streams)
 	case "version":
+		if len(args) != 0 {
+			return fail(streams.Err, 2, errors.New("version takes no arguments or options"))
+		}
 		fmt.Fprintln(streams.Out, buildinfo.String())
 		return 0
 	case "update":
@@ -415,7 +421,7 @@ func runGHDB(args []string, ioo IO) int {
 		r.GHDBShow(toUIEntry(e, e.QueryTemplate), true)
 		return 0
 	case "find":
-		if len(rest) < 2 {
+		if len(rest) < 2 || strings.TrimSpace(strings.Join(rest[1:], " ")) == "" {
 			return fail(ioo.Err, 2, errors.New("ghdb find requires a search term"))
 		}
 		found := ghdb.Find(strings.Join(rest[1:], " "))
@@ -669,6 +675,9 @@ func runSearch(args []string, ioo IO, resumeID string, resuming bool, origin sea
 	}
 	if resuming && (len(o.Queries) > 0 || len(o.Files) > 0) {
 		return fail(ioo.Err, 2, errors.New("--resume cannot be combined with -q or -f"))
+	}
+	if o.Stream && o.Output == "-" {
+		return fail(ioo.Err, 2, errors.New("--stream and --output - would duplicate stdout"))
 	}
 	cfg, err := config.Load(o.Config)
 	if err != nil {
@@ -982,9 +991,6 @@ func runSearch(args []string, ioo IO, resumeID string, resuming bool, origin sea
 		}
 	}
 	if code == 0 && exportDestination != "" {
-		if o.Stream && o.Output == "-" {
-			return fail(ioo.Err, 2, errors.New("--stream and --output - would duplicate stdout"))
-		}
 		var e error
 		outputCount, e = exporter.WriteCollapsed(cleanupCtx, st, job, o.Format, exportDestination, o.Overwrite, ioo.Out, collapseMode)
 		if e != nil {
@@ -1066,7 +1072,7 @@ func providers(c config.Config, client *http.Client, selected []string) ([]sched
 	var all []candidate
 	spc := c.Providers["searxng"]
 	instanceCfgs := append([]config.SearXNGInstanceConfig(nil), spc.Instances...)
-	if envURL := strings.TrimSpace(os.Getenv("SEARXNG_URL")); envURL != "" && len(instanceCfgs) == 0 {
+	if envURL := strings.TrimSpace(os.Getenv("SEARXNG_URL")); envURL != "" {
 		instanceCfgs = []config.SearXNGInstanceConfig{{Name: "local", URL: envURL, TokenEnv: "SEARXNG_TOKEN", RequestsPerSecond: spc.RequestsPerSecond, Burst: spc.Burst}}
 	}
 	var sxClients []*searxng.Client
@@ -1490,6 +1496,13 @@ func runExport(args []string, ioo IO) int {
 		return fail(ioo.Err, 1, err)
 	}
 	defer st.Close()
+	exists, err := st.JobExists(context.Background(), job)
+	if err != nil {
+		return fail(ioo.Err, 1, err)
+	}
+	if !exists {
+		return fail(ioo.Err, 1, fmt.Errorf("job %q not found", job))
+	}
 	if _, err = exporter.WriteCollapsed(context.Background(), st, job, *format, *out, *overwrite, ioo.Out, mode); err != nil {
 		return fail(ioo.Err, 1, fmt.Errorf("write output %q: %w\nchoose a writable path with --output", *out, err))
 	}
@@ -1629,12 +1642,13 @@ func runDoctor(args []string, ioo IO) int {
 		}
 		fmt.Fprintf(ioo.Out, "    %-12s %s\n", s.Name, state)
 	}
-	fmt.Fprintf(ioo.Out, "  %-14s %d available\n", "Providers", available)
+	fmt.Fprintf(ioo.Out, "  %-14s %d configured\n", "Providers", available)
 	if available == 0 {
 		fmt.Fprintln(ioo.Out, "\nNo search provider is ready yet. Run `dorker setup`.")
 		return 0
 	}
-	fmt.Fprintln(ioo.Out, "\nEverything looks good.")
+	fmt.Fprintln(ioo.Out, "\nConfiguration and local paths look good.")
+	fmt.Fprintln(ioo.Out, "Provider reachability was not tested; run `dorker providers test NAME`.")
 	return 0
 }
 

@@ -2,6 +2,7 @@ package provider
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,10 +18,15 @@ func DecodeJSONResponse(resp *http.Response, max int64, dst any) error {
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, max+1))
 	if err != nil {
-		return TransportError("read response", err)
+		classified := TransportError("read response", err)
+		var pe *Error
+		if errors.As(classified, &pe) {
+			pe.HTTPStatus = resp.StatusCode
+		}
+		return classified
 	}
 	if int64(len(body)) > max {
-		return &Error{Kind: KindMalformed, Message: "response exceeds size limit"}
+		return &Error{Kind: KindMalformed, Message: "response exceeds size limit", HTTPStatus: resp.StatusCode}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return classifyHTTP(resp, body)
@@ -28,13 +34,13 @@ func DecodeJSONResponse(resp *http.Response, max int64, dst any) error {
 	ct := strings.ToLower(resp.Header.Get("Content-Type"))
 	low := strings.ToLower(string(body))
 	if strings.Contains(ct, "text/html") && (strings.Contains(low, "captcha") || strings.Contains(low, "challenge")) {
-		return &Error{Kind: KindChallenge, Message: "provider returned a challenge page", RetryAfter: time.Minute}
+		return &Error{Kind: KindChallenge, Message: "provider returned a challenge page", RetryAfter: time.Minute, HTTPStatus: resp.StatusCode}
 	}
 	if strings.Contains(ct, "text/html") || strings.HasPrefix(strings.TrimSpace(low), "<!doctype html") || strings.HasPrefix(strings.TrimSpace(low), "<html") {
-		return &Error{Kind: KindUnauthorized, Message: "expected JSON search response but received HTML"}
+		return &Error{Kind: KindUnauthorized, Message: "expected JSON search response but received HTML", HTTPStatus: resp.StatusCode}
 	}
 	if err := json.Unmarshal(body, dst); err != nil {
-		return &Error{Kind: KindMalformed, Message: "decode JSON response", Cause: err}
+		return &Error{Kind: KindMalformed, Message: "decode JSON response", Cause: err, HTTPStatus: resp.StatusCode}
 	}
 	return nil
 }

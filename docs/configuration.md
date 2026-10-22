@@ -4,7 +4,7 @@ The first plain `dorker` run creates a minimal starter file atomically. `dorker 
 
 Dorker uses `os.UserConfigDir()`: normally `$XDG_CONFIG_HOME/dorker/config.yaml` or `~/.config/dorker/config.yaml` on Linux, `~/Library/Application Support/dorker/config.yaml` on macOS, and `%AppData%\dorker\config.yaml` on Windows. `DORKER_CONFIG` and `--config` override it.
 
-API credentials are read from `BRAVE_API_KEY`, `GOOGLE_API_KEY` plus `GOOGLE_CSE_ID`, and `SERPAPI_API_KEY`. SearXNG can use `SEARXNG_URL`; YAML instances may name a token environment variable. Never commit credentials.
+API credentials are read from `BRAVE_API_KEY`, `GOOGLE_API_KEY` plus `GOOGLE_CSE_ID`, and `SERPAPI_API_KEY`. SearXNG can use `SEARXNG_URL`; when set, it overrides YAML instances for that invocation. YAML instances may name a token environment variable. Never commit credentials.
 
 `validation.mode` accepts `off`, `conservative`, or `strict`. Site inclusion/exclusion is always enforced as scope after URL normalization; `off` disables optional extension and `inurl` checks, not the site boundary.
 

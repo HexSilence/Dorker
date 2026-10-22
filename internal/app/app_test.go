@@ -48,6 +48,23 @@ func TestProviderDiagnosticsNeverPrintSecrets(t *testing.T) {
 	}
 }
 
+func TestSearXNGEnvironmentOverridesConfiguredInstances(t *testing.T) {
+	t.Setenv("SEARXNG_URL", "http://127.0.0.1:9999")
+	cfg := config.Default()
+	providerCfg := cfg.Providers["searxng"]
+	providerCfg.Enabled = true
+	providerCfg.Instances = []config.SearXNGInstanceConfig{{Name: "configured", URL: "http://127.0.0.1:8888"}}
+	cfg.Providers["searxng"] = providerCfg
+
+	_, statuses := providers(cfg, &http.Client{}, []string{"searxng"})
+	if len(statuses) == 0 || len(statuses[0].Instances) != 1 {
+		t.Fatalf("statuses=%+v", statuses)
+	}
+	if got := statuses[0].Instances[0].Name; got != "local" {
+		t.Fatalf("instance=%q, want environment-provided local instance", got)
+	}
+}
+
 func TestNoArgumentAndHelpPresentation(t *testing.T) {
 	t.Setenv("DORKER_CONFIG", filepath.Join(t.TempDir(), "dorker", "config.yaml"))
 	var out, errout bytes.Buffer
@@ -80,12 +97,16 @@ func TestCLIOptionValidationRegressions(t *testing.T) {
 		{"resume query conflict", []string{"search", "--resume", "-q", "x"}, "cannot be combined"},
 		{"negative workers", []string{"search", "-q", "x", "--workers", "-1", "--dry-run"}, "workers"},
 		{"negative recovery wait", []string{"search", "-q", "x", "--max-recovery-wait", "-1s", "--dry-run"}, "max-recovery-wait"},
+		{"stream stdout conflict", []string{"search", "-q", "x", "--provider", "mock", "--stream", "--output", "-"}, "duplicate stdout"},
 		{"searx engines wrong provider", []string{"search", "-q", "x", "--provider", "mock", "--searxng-engines", "duckduckgo", "--dry-run"}, "require --provider searxng"},
 		{"empty searx engines", []string{"search", "-q", "x", "--provider", "searxng", "--searxng-engines=", "--dry-run"}, "non-empty"},
 		{"discover page zero", []string{"discover", "-q", "x", "--page-size", "0", "--dry-run"}, "page-size"},
 		{"discover page too large", []string{"discover", "-q", "x", "--page-size", "101", "--dry-run"}, "page-size"},
 		{"discover workers negative", []string{"discover", "-q", "x", "--workers", "-1", "--dry-run"}, "workers"},
 		{"discover unknown provider", []string{"discover", "-q", "site:example.com", "--provider", "does-not-exist", "--dry-run"}, "unknown provider"},
+		{"discover explicit negative depth", []string{"discover", "-q", "site:example.com", "--max-depth", "-1", "--dry-run"}, "max-depth"},
+		{"discover negative saturation", []string{"discover", "-q", "site:example.com", "--saturation-threshold", "-0.1", "--dry-run"}, "saturation-threshold"},
+		{"discover invalid dry-run log level", []string{"discover", "-q", "site:example.com", "--log-level", "garbage", "--dry-run"}, "invalid log level"},
 		{"query validate extra arg", []string{"query", "validate", "-q", "site:example.com", "-u", "https://example.com", "extra"}, "unexpected argument"},
 		{"instance on non-searx", []string{"providers", "test", "brave", "--instance", "local"}, "only valid for the searxng"},
 		{"export extra argument", []string{"export", "job", "-o", filepath.Join(t.TempDir(), "out.txt"), "extra"}, "unexpected arguments"},
@@ -103,6 +124,15 @@ func TestCLIOptionValidationRegressions(t *testing.T) {
 	}
 }
 
+func TestVersionRejectsTrailingArguments(t *testing.T) {
+	for _, args := range [][]string{{"version", "extra"}, {"--version", "extra"}} {
+		var out, stderr bytes.Buffer
+		if code := Run(args, IO{Out: &out, Err: &stderr}); code != 2 || out.Len() != 0 {
+			t.Fatalf("args=%v code=%d stdout=%q stderr=%q", args, code, out.String(), stderr.String())
+		}
+	}
+}
+
 func TestGHDBNestedHelpIsHelpNotInput(t *testing.T) {
 	for _, sub := range []string{"list", "show", "find", "run"} {
 		var out, stderr bytes.Buffer
@@ -112,6 +142,13 @@ func TestGHDBNestedHelpIsHelpNotInput(t *testing.T) {
 		if !strings.Contains(out.String(), "Usage:") {
 			t.Fatalf("%s output=%q", sub, out.String())
 		}
+	}
+}
+
+func TestGHDBFindRejectsEmptyTerm(t *testing.T) {
+	var out, stderr bytes.Buffer
+	if code := Run([]string{"ghdb", "find", "  "}, IO{Out: &out, Err: &stderr}); code != 2 || !strings.Contains(stderr.String(), "requires a search term") {
+		t.Fatalf("code/output=%d %q", code, stderr.String())
 	}
 }
 
@@ -213,6 +250,18 @@ func TestDoctorCleanMachineIsActionableAndDoesNotLeakSecrets(t *testing.T) {
 	}
 	if strings.Contains(text, "DO_NOT_PRINT_THIS_SECRET") {
 		t.Fatalf("secret leaked: %s", text)
+	}
+}
+
+func TestExportRejectsUnknownJob(t *testing.T) {
+	dir := t.TempDir()
+	var out, stderr bytes.Buffer
+	code := Run([]string{"export", "missing", "-o", filepath.Join(dir, "out.txt"), "--db", filepath.Join(dir, "db.sqlite"), "--config", filepath.Join(dir, "missing.yaml")}, IO{Out: &out, Err: &stderr})
+	if code != 1 || !strings.Contains(stderr.String(), "job \"missing\" not found") {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, out.String(), stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "out.txt")); !os.IsNotExist(err) {
+		t.Fatalf("unexpected export created: %v", err)
 	}
 }
 
