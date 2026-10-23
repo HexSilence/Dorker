@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"io"
 	"log/slog"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,6 +29,75 @@ type transportFailureProvider struct{}
 func (transportFailureProvider) Name() string { return "transport" }
 func (transportFailureProvider) Health() provider.HealthStatus {
 	return provider.HealthStatus{State: provider.Ready}
+}
+
+type cursorResumeProvider struct {
+	mu      sync.Mutex
+	cursors []string
+	cancel  context.CancelFunc
+}
+
+func (p *cursorResumeProvider) Name() string { return "cursor" }
+func (p *cursorResumeProvider) Health() provider.HealthStatus {
+	return provider.HealthStatus{State: provider.Ready}
+}
+func (p *cursorResumeProvider) Search(ctx context.Context, r provider.SearchRequest) (provider.SearchResponse, error) {
+	p.mu.Lock()
+	p.cursors = append(p.cursors, r.Cursor)
+	p.mu.Unlock()
+	switch r.Cursor {
+	case "":
+		return provider.SearchResponse{Results: []model.Result{{URL: "https://example.test/0"}}, NextCursor: "10"}, nil
+	case "10":
+		return provider.SearchResponse{Results: []model.Result{{URL: "https://example.test/10"}}, NextCursor: "20"}, nil
+	case "20":
+		if p.cancel != nil {
+			p.cancel()
+			return provider.SearchResponse{}, ctx.Err()
+		}
+		return provider.SearchResponse{Results: []model.Result{{URL: "https://example.test/20"}}, Done: true}, nil
+	default:
+		return provider.SearchResponse{}, &provider.Error{Kind: provider.KindMalformed, Message: "unexpected cursor"}
+	}
+}
+
+func TestResumePreservesProviderContinuationCursor(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "cursor.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err = st.CreateJob(ctx, "job", "{}"); err != nil {
+		t.Fatal(err)
+	}
+	vs := []model.QueryVariant{{Original: "q", Variant: "q"}}
+	if err = st.AddVariants(ctx, "job", vs); err != nil {
+		t.Fatal(err)
+	}
+	col := &collector.Collector{Store: st, JobID: "job", Normalizer: normalize.New(normalize.Options{})}
+	cctx, cancel := context.WithCancel(ctx)
+	first := &cursorResumeProvider{cancel: cancel}
+	opts := Options{Workers: 1, MaxPages: 10, PageSize: 100, Retry: rl.RetryPolicy{MaxAttempts: 1}}
+	if err = New(st, col, slog.New(slog.NewTextHandler(io.Discard, nil)), opts).Run(cctx, "job", vs, []Runtime{NewRuntime(first, 1000, 1)}, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("first run error=%v", err)
+	}
+	progress, err := st.LoadProgress(ctx, "job")
+	if err != nil || len(progress) != 1 || progress[0].Cursor != "20" || progress[0].Page != 2 {
+		t.Fatalf("progress=%+v err=%v", progress, err)
+	}
+	resumedProvider := &cursorResumeProvider{}
+	resumedCollector := &collector.Collector{Store: st, JobID: "job", Normalizer: normalize.New(normalize.Options{})}
+	if err = New(st, resumedCollector, slog.New(slog.NewTextHandler(io.Discard, nil)), opts).Run(ctx, "job", vs, []Runtime{NewRuntime(resumedProvider, 1000, 1)}, progress); err != nil {
+		t.Fatal(err)
+	}
+	if len(resumedProvider.cursors) != 1 || resumedProvider.cursors[0] != "20" {
+		t.Fatalf("resume cursors=%v", resumedProvider.cursors)
+	}
+	stats, err := st.Stats(ctx, "job")
+	if err != nil || stats.Unique != 3 {
+		t.Fatalf("stats=%+v err=%v", stats, err)
+	}
 }
 func (transportFailureProvider) Search(context.Context, provider.SearchRequest) (provider.SearchResponse, error) {
 	return provider.SearchResponse{}, &provider.Error{Kind: provider.KindConnection, Message: "connection refused"}

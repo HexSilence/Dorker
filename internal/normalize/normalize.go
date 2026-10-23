@@ -31,7 +31,7 @@ func New(opts Options) *Normalizer {
 	return &Normalizer{opts: opts}
 }
 
-var tracking = map[string]struct{}{"gclid": {}, "fbclid": {}, "dclid": {}, "msclkid": {}, "mc_cid": {}, "mc_eid": {}}
+var tracking = map[string]struct{}{"gclid": {}, "fbclid": {}, "dclid": {}, "msclkid": {}, "mc_cid": {}, "mc_eid": {}, "srsltid": {}}
 
 func (n *Normalizer) Normalize(raw string) (normalized, domain string, err error) {
 	if len(raw) == 0 || len(raw) > n.opts.MaxLength {

@@ -2,6 +2,7 @@ package collector
 
 import (
 	"context"
+	"fmt"
 	"github.com/HexSilence/dorker/internal/model"
 	"github.com/HexSilence/dorker/internal/normalize"
 	"github.com/HexSilence/dorker/internal/query"
@@ -120,5 +121,99 @@ func TestDiscoveryExpansionRetainsSeedScope(t *testing.T) {
 	}
 	if c.Unique.Load() != 1 || c.Rejected.Load() != 1 {
 		t.Fatalf("unique=%d rejected=%d", c.Unique.Load(), c.Rejected.Load())
+	}
+}
+
+func TestUniqueLimitScansPastRejectedMalformedAndDuplicateCandidates(t *testing.T) {
+	for _, tc := range []struct {
+		name                                                     string
+		page                                                     []string
+		wantRejected, wantMalformed, wantDuplicates, wantSkipped int64
+	}{
+		{
+			name: "rejected and duplicates before unique",
+			page: []string{
+				"https://attacker.test/one", "https://attacker.test/two",
+				"https://example.sa/old-a", "https://example.sa/old-b",
+				"https://example.sa/new-a", "https://example.sa/new-b", "https://example.sa/new-c",
+			},
+			wantRejected: 2, wantDuplicates: 2,
+		},
+		{
+			name: "many duplicates before unique",
+			page: []string{
+				"https://example.sa/old-a", "https://example.sa/old-b", "https://example.sa/old-a", "https://example.sa/old-b",
+				"https://example.sa/old-a", "https://example.sa/old-b", "https://example.sa/old-a", "https://example.sa/old-b",
+				"https://example.sa/old-a", "https://example.sa/old-b",
+				"https://example.sa/new-a", "https://example.sa/new-b", "https://example.sa/new-c",
+			},
+			wantDuplicates: 10,
+		},
+		{
+			name: "cap exactly enforced after all candidate classes",
+			page: []string{
+				"://bad", "not a URL", "https://attacker.test/one", "https://attacker.test/two",
+				"https://example.sa/old-a", "https://example.sa/old-b",
+				"https://example.sa/new-a", "https://example.sa/new-b", "https://example.sa/new-c", "https://example.sa/new-d", "https://example.sa/new-e",
+			},
+			wantMalformed: 2, wantRejected: 2, wantDuplicates: 2, wantSkipped: 2,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			s, err := store.Open(filepath.Join(t.TempDir(), "limits.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s.Close()
+			if err = s.CreateJob(ctx, "j", "{}"); err != nil {
+				t.Fatal(err)
+			}
+			seed := &Collector{Store: s, JobID: "j", Normalizer: normalize.New(normalize.Options{}), ValidationMode: query.ValidationConservative}
+			base := []model.Result{
+				{URL: "https://example.sa/old-a", Provider: "seed", OriginalQuery: "site:.sa", QueryVariant: "site:.sa", DiscoveredAt: time.Now()},
+				{URL: "https://example.sa/old-b", Provider: "seed", OriginalQuery: "site:.sa", QueryVariant: "site:.sa", DiscoveredAt: time.Now()},
+			}
+			if _, err = seed.AddBatch(ctx, base); err != nil {
+				t.Fatal(err)
+			}
+			c := &Collector{Store: s, JobID: "j", Normalizer: normalize.New(normalize.Options{}), ValidationMode: query.ValidationConservative}
+			results := make([]model.Result, 0, len(tc.page))
+			for _, u := range tc.page {
+				results = append(results, model.Result{URL: u, Provider: "test", OriginalQuery: "site:.sa", QueryVariant: "site:.sa", DiscoveredAt: time.Now()})
+			}
+			fresh, skipped, err := c.AddBatchLimited(ctx, results, 3)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fresh != 3 || skipped != int(tc.wantSkipped) || c.Unique.Load() != 3 || c.Rejected.Load() != tc.wantRejected || c.Malformed.Load() != tc.wantMalformed || c.Duplicates.Load() != tc.wantDuplicates || c.LimitSkipped.Load() != tc.wantSkipped {
+				t.Fatalf("fresh=%d skipped=%d unique=%d rejected=%d malformed=%d duplicates=%d limitSkipped=%d", fresh, skipped, c.Unique.Load(), c.Rejected.Load(), c.Malformed.Load(), c.Duplicates.Load(), c.LimitSkipped.Load())
+			}
+			stats, err := s.Stats(ctx, "j")
+			if err != nil || stats.Unique != 5 {
+				t.Fatalf("stats=%+v err=%v", stats, err)
+			}
+		})
+	}
+}
+
+func TestZeroUniqueLimitMeansUnlimited(t *testing.T) {
+	ctx := context.Background()
+	s, err := store.Open(filepath.Join(t.TempDir(), "unlimited.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err = s.CreateJob(ctx, "j", "{}"); err != nil {
+		t.Fatal(err)
+	}
+	c := &Collector{Store: s, JobID: "j", Normalizer: normalize.New(normalize.Options{})}
+	var results []model.Result
+	for i := 0; i < 150; i++ {
+		results = append(results, model.Result{URL: fmt.Sprintf("https://example.test/%03d", i), Provider: "test", OriginalQuery: "q", QueryVariant: "q", DiscoveredAt: time.Now()})
+	}
+	fresh, skipped, err := c.AddBatchLimited(ctx, results, -1)
+	if err != nil || fresh != 150 || skipped != 0 {
+		t.Fatalf("fresh=%d skipped=%d err=%v", fresh, skipped, err)
 	}
 }

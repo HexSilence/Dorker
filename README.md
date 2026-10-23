@@ -119,6 +119,8 @@ dorker query validate -q 'site:example.com ext:pdf' -u 'https://docs.example.com
 
 Hostname matching is DNS-label aware. A result under `example.com.attacker.test`, or merely containing `example.com` in its path/query, does not satisfy `site:example.com`. Mandatory positive-site scope remains fail-closed in every validation mode. `off`, `conservative`, and `strict` control optional locally enforceable checks; they do not weaken site scope. Provider-only operators remain provider-side rather than being falsely rejected locally.
 
+Search limits count normalized unique URLs: `--max-results` is job-wide and `--max-results-per-query` applies to each original query. Rejected, malformed, and duplicate provider entries do not consume those budgets; `0` means unlimited. `--max-pages` is a per-provider/query ceiling, but explicit provider exhaustion or evidence-based saturation can stop earlier. Common tracking-only parameters, including `utm_*`, `gclid`, `fbclid`, and `srsltid`, are removed during normalization unless `--keep-tracking-params` is selected.
+
 ## Discovery
 
 ```text

@@ -32,7 +32,17 @@ func New(c *http.Client, key, endpoint string, maxBody int64) *Client {
 func (c *Client) Name() string                  { return "serpapi" }
 func (c *Client) Health() provider.HealthStatus { return c.health.Snapshot() }
 func (c *Client) Capabilities() provider.Capabilities {
+	// SerpAPI accepts num up to 100, but does not guarantee that many organic
+	// results. Pagination therefore follows the upstream next offset rather
+	// than treating this requested maximum as the amount actually returned.
 	return provider.Capabilities{PageSizeMaximum: 100, SupportsPagination: true}
+}
+func (c *Client) Pagination(r provider.SearchRequest) provider.PaginationInfo {
+	start := 0
+	if r.Cursor != "" {
+		start, _ = strconv.Atoi(r.Cursor)
+	}
+	return provider.PaginationInfo{UpstreamOffset: start, OffsetBased: true, PageSizeApplied: true}
 }
 func (c *Client) Search(ctx context.Context, r provider.SearchRequest) (out provider.SearchResponse, err error) {
 	started := time.Now()
@@ -48,16 +58,18 @@ func (c *Client) Search(ctx context.Context, r provider.SearchRequest) (out prov
 		return out, &provider.Error{Kind: provider.KindUnauthorized, Message: "SERPAPI_API_KEY is required"}
 	}
 	n := r.PageSize
-	if n <= 0 || n > 100 {
+	if n <= 0 || n > c.Capabilities().PageSizeMaximum {
 		n = 10
 	}
-	start := r.Page * n
+	start := 0
 	if r.Cursor != "" {
 		var parseErr error
 		start, parseErr = strconv.Atoi(r.Cursor)
 		if parseErr != nil || start < 0 {
 			return out, &provider.Error{Kind: provider.KindInvalidQuery, Message: "invalid pagination cursor"}
 		}
+	} else if r.Page > 0 {
+		return out, &provider.Error{Kind: provider.KindMalformed, Message: "missing upstream pagination cursor"}
 	}
 	u, e := url.Parse(c.endpoint)
 	if e != nil {
@@ -116,9 +128,39 @@ func (c *Client) Search(ctx context.Context, r provider.SearchRequest) (out prov
 		out.Results = append(out.Results, model.Result{URL: x.Link, Title: x.Title, Snippet: x.Snippet, Provider: c.Name(), OriginalQuery: r.OriginalQuery, QueryVariant: r.Query, Rank: x.Position, Page: strconv.Itoa(r.Page), DiscoveredAt: time.Now().UTC()})
 		out.Results[len(out.Results)-1].Rank = rank
 	}
-	out.Done = len(p.Organic) == 0 || p.Pagination.Next == ""
+	out.Done = p.Pagination.Next == ""
 	if !out.Done {
-		out.NextCursor = strconv.Itoa(start + n)
+		next, nextErr := validatedNextStart(p.Pagination.Next, c.endpoint, start)
+		if nextErr != nil {
+			// Preserve this page's usable results but stop rather than guessing an
+			// offset that could replay or skip upstream results.
+			out.Done = true
+			out.PartialErrors = append(out.PartialErrors, &provider.Error{Kind: provider.KindMalformed, Message: "invalid SerpAPI next-page metadata"})
+		} else {
+			out.NextCursor = strconv.Itoa(next)
+		}
 	}
 	return out, nil
 }
+
+func validatedNextStart(raw, endpoint string, current int) (int, error) {
+	nextURL, err := url.Parse(raw)
+	if err != nil {
+		return 0, err
+	}
+	base, err := url.Parse(endpoint)
+	if err != nil {
+		return 0, err
+	}
+	if nextURL.IsAbs() && (!strings.EqualFold(nextURL.Scheme, base.Scheme) || !strings.EqualFold(nextURL.Host, base.Host)) {
+		return 0, &provider.Error{Kind: provider.KindMalformed, Message: "unexpected SerpAPI pagination origin"}
+	}
+	value := nextURL.Query().Get("start")
+	next, err := strconv.Atoi(value)
+	if err != nil || next <= current {
+		return 0, &provider.Error{Kind: provider.KindMalformed, Message: "invalid SerpAPI pagination offset"}
+	}
+	return next, nil
+}
+
+var _ provider.PaginationDescriber = (*Client)(nil)

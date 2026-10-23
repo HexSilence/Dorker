@@ -219,44 +219,69 @@ func (s *Store) InsertResult(ctx context.Context, job string, r model.Result) (b
 // slice reports whether each URL was new to this job (provenance is retained
 // even when a URL was already discovered by another provider).
 func (s *Store) InsertResults(ctx context.Context, job string, results []model.Result) ([]bool, error) {
-	fresh := make([]bool, len(results))
+	fresh, _, err := s.InsertResultsLimited(ctx, job, results, -1)
+	return fresh, err
+}
+
+// InsertResultsLimited persists a provider page while admitting at most
+// maxNew URLs that are new to this job. A negative limit is unlimited.
+// Existing URLs still retain their additional provenance after the unique
+// budget is exhausted. skipped reports candidates that would have been new
+// but were not persisted because the budget was full.
+func (s *Store) InsertResultsLimited(ctx context.Context, job string, results []model.Result, maxNew int) (fresh, skipped []bool, err error) {
+	fresh = make([]bool, len(results))
+	skipped = make([]bool, len(results))
 	if len(results) == 0 {
-		return fresh, nil
+		return fresh, skipped, nil
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer tx.Rollback()
+	newCount := 0
 	for i, r := range results {
 		now := r.DiscoveredAt.UTC().Format(time.RFC3339Nano)
-		res, e := tx.ExecContext(ctx, `INSERT INTO urls(normalized_url,domain,first_seen) VALUES(?,?,?) ON CONFLICT(normalized_url) DO NOTHING`, r.NormalizedURL, r.Domain, now)
-		if e != nil {
-			return nil, e
-		}
-		inserted, e := res.RowsAffected()
-		if e != nil {
-			return nil, e
-		}
 		var uid int64
-		if e = tx.QueryRowContext(ctx, `SELECT id FROM urls WHERE normalized_url=?`, r.NormalizedURL).Scan(&uid); e != nil {
-			return nil, e
+		e := tx.QueryRowContext(ctx, `SELECT id FROM urls WHERE normalized_url=?`, r.NormalizedURL).Scan(&uid)
+		if e != nil && !errors.Is(e, sql.ErrNoRows) {
+			return nil, nil, e
 		}
 		var existed int
-		if e = tx.QueryRowContext(ctx, `SELECT count(*) FROM discoveries WHERE job_id=? AND url_id=?`, job, uid).Scan(&existed); e != nil {
-			return nil, e
+		if e == nil {
+			if e = tx.QueryRowContext(ctx, `SELECT count(*) FROM discoveries WHERE job_id=? AND url_id=?`, job, uid).Scan(&existed); e != nil {
+				return nil, nil, e
+			}
+		}
+		isNew := existed == 0
+		if isNew && maxNew >= 0 && newCount >= maxNew {
+			skipped[i] = true
+			continue
+		}
+		if uid == 0 {
+			res, insertErr := tx.ExecContext(ctx, `INSERT INTO urls(normalized_url,domain,first_seen) VALUES(?,?,?) ON CONFLICT(normalized_url) DO NOTHING`, r.NormalizedURL, r.Domain, now)
+			if insertErr != nil {
+				return nil, nil, insertErr
+			}
+			_ = res
+			if e = tx.QueryRowContext(ctx, `SELECT id FROM urls WHERE normalized_url=?`, r.NormalizedURL).Scan(&uid); e != nil {
+				return nil, nil, e
+			}
 		}
 		engines, _ := json.Marshal(r.SourceEngines)
 		_, e = tx.ExecContext(ctx, `INSERT INTO discoveries(job_id,url_id,original_url,title,snippet,provider,provider_instance,source_engines,original_query,query_variant,rank,page,discovered_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`, job, uid, r.URL, r.Title, r.Snippet, r.Provider, r.ProviderInstance, string(engines), r.OriginalQuery, r.QueryVariant, r.Rank, r.Page, now)
 		if e != nil {
-			return nil, e
+			return nil, nil, e
 		}
-		fresh[i] = existed == 0 && inserted >= 0
+		fresh[i] = isNew
+		if isNew {
+			newCount++
+		}
 	}
 	if err = tx.Commit(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return fresh, nil
+	return fresh, skipped, nil
 }
 
 func (s *Store) SaveProgress(ctx context.Context, p Progress) error {

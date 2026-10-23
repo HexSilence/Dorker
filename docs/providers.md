@@ -47,6 +47,8 @@ SERPAPI_API_KEY
 
 Enable the provider in YAML and test with `dorker providers test serpapi`.
 
+SerpAPI's `num` parameter is a requested maximum and Google may return fewer organic results. Dorker follows the validated `start` offset from `serpapi_pagination.next`; it never advances by the requested `--page-size` alone. A short page therefore continues when upstream supplies a continuation, while an absent continuation means provider exhaustion. `--max-pages` remains the hard request ceiling.
+
 ## Development provider
 
 The deterministic `mock` provider is for tests and local development. It is disabled in normal configuration and requires no credentials.

@@ -24,6 +24,27 @@ func TestKeepTracking(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+func TestSRSltidTrackingNormalization(t *testing.T) {
+	tests := []struct {
+		name, input, want string
+		keep              bool
+	}{
+		{"only", "https://nv.sa/?srsltid=ABC", "https://nv.sa/", false},
+		{"case insensitive", "https://nv.sa/?SRSltid=ABC", "https://nv.sa/", false},
+		{"with utm", "https://example.sa/path?srsltid=ABC&utm_source=x", "https://example.sa/path", false},
+		{"meaningful stable", "https://example.sa/path?z=2&srsltid=ABC&id=123", "https://example.sa/path?id=123&z=2", false},
+		{"kept", "https://nv.sa/?srsltid=ABC", "https://nv.sa/?srsltid=ABC", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, _, err := New(Options{KeepTracking: tt.keep}).Normalize(tt.input)
+			if err != nil || got != tt.want {
+				t.Fatalf("Normalize()=%q,%v want %q", got, err, tt.want)
+			}
+		})
+	}
+}
 func TestRejectSchemes(t *testing.T) {
 	if _, _, err := New(Options{}).Normalize("javascript:alert(1)"); err == nil {
 		t.Fatal("expected error")

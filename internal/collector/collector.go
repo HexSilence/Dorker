@@ -72,18 +72,18 @@ func (f Filter) Accept(u, domain string) bool {
 }
 
 type Collector struct {
-	Store                                                               *store.Store
-	JobID                                                               string
-	Normalizer                                                          *normalize.Normalizer
-	Filter                                                              Filter
-	OnUnique                                                            func(string)
-	OnRejected                                                          func(model.Result, query.ValidationResult)
-	ValidationMode                                                      query.ValidationMode
-	ScopeConstraints                                                    *query.QueryConstraints
-	Raw, Accepted, Rejected, UnknownKept, Unique, Duplicates, Malformed atomic.Int64
-	constraints                                                         sync.Map
-	reasonsMu                                                           sync.Mutex
-	reasons                                                             map[query.ValidationReason]int64
+	Store                                                                             *store.Store
+	JobID                                                                             string
+	Normalizer                                                                        *normalize.Normalizer
+	Filter                                                                            Filter
+	OnUnique                                                                          func(string)
+	OnRejected                                                                        func(model.Result, query.ValidationResult)
+	ValidationMode                                                                    query.ValidationMode
+	ScopeConstraints                                                                  *query.QueryConstraints
+	Raw, Accepted, Rejected, UnknownKept, Unique, Duplicates, Malformed, LimitSkipped atomic.Int64
+	constraints                                                                       sync.Map
+	reasonsMu                                                                         sync.Mutex
+	reasons                                                                           map[query.ValidationReason]int64
 }
 
 func (c *Collector) RejectionReasons() map[query.ValidationReason]int64 {
@@ -114,6 +114,15 @@ func (c *Collector) Add(ctx context.Context, r model.Result) (bool, error) {
 
 // AddBatch normalizes and persists a complete response page atomically.
 func (c *Collector) AddBatch(ctx context.Context, results []model.Result) (int, error) {
+	fresh, _, err := c.AddBatchLimited(ctx, results, -1)
+	return fresh, err
+}
+
+// AddBatchLimited evaluates the entire provider page, but persists at most
+// maxNew URLs that are new to this job. Rejected, malformed, and duplicate
+// entries never consume the unique-result budget. A negative limit is
+// unlimited.
+func (c *Collector) AddBatchLimited(ctx context.Context, results []model.Result, maxNew int) (int, int, error) {
 	valid := make([]model.Result, 0, len(results))
 	c.Raw.Add(int64(len(results)))
 	for _, r := range results {
@@ -129,7 +138,7 @@ func (c *Collector) AddBatch(ctx context.Context, results []model.Result) (int, 
 		}
 		constraints, err := c.constraintsFor(r.OriginalQuery)
 		if err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 		vr := constraints.Evaluate(n, mode)
 		if vr.Decision != "REJECT" && c.ScopeConstraints != nil {
@@ -165,12 +174,17 @@ func (c *Collector) AddBatch(ctx context.Context, results []model.Result) (int, 
 		r.NormalizedURL, r.Domain = n, d
 		valid = append(valid, r)
 	}
-	fresh, err := c.Store.InsertResults(ctx, c.JobID, valid)
+	fresh, skipped, err := c.Store.InsertResultsLimited(ctx, c.JobID, valid, maxNew)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	count := 0
+	count, skippedCount := 0, 0
 	for i, isFresh := range fresh {
+		if skipped[i] {
+			skippedCount++
+			c.LimitSkipped.Add(1)
+			continue
+		}
 		if isFresh {
 			count++
 			c.Unique.Add(1)
@@ -181,7 +195,7 @@ func (c *Collector) AddBatch(ctx context.Context, results []model.Result) (int, 
 			c.Duplicates.Add(1)
 		}
 	}
-	return count, nil
+	return count, skippedCount, nil
 }
 
 func (c *Collector) addReason(reason query.ValidationReason) {

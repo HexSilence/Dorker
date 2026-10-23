@@ -3,6 +3,7 @@ package scheduler
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -227,6 +228,58 @@ func TestMaxResultsHasDistinctStopReason(t *testing.T) {
 	}
 }
 
+func TestConcurrentProvidersRespectExactUniqueCap(t *testing.T) {
+	st, col, vs := adaptiveFixture(t)
+	results := func(prefix string) []model.Result {
+		out := make([]model.Result, 0, 5)
+		for i := 0; i < 5; i++ {
+			out = append(out, model.Result{URL: fmt.Sprintf("https://example.test/%s-%d", prefix, i), Provider: prefix, DiscoveredAt: time.Now()})
+		}
+		return out
+	}
+	a := &sequenceProvider{name: "a", responses: []provider.SearchResponse{{Results: results("a")}}}
+	b := &sequenceProvider{name: "b", responses: []provider.SearchResponse{{Results: results("b")}}}
+	s := New(st, col, slog.New(slog.NewTextHandler(io.Discard, nil)), Options{Workers: 2, MaxPages: 10, MaxResults: 3, MaxResultsPerQuery: 3, PageSize: 10, Retry: rl.RetryPolicy{MaxAttempts: 1}})
+	if err := s.Run(context.Background(), "job", vs, []Runtime{NewRuntime(a, 1000, 1), NewRuntime(b, 1000, 1)}, nil); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := st.Stats(context.Background(), "job")
+	if err != nil || stats.Unique != 3 || col.Unique.Load() != 3 || col.LimitSkipped.Load() != 7 {
+		t.Fatalf("stats=%+v unique=%d skipped=%d err=%v", stats, col.Unique.Load(), col.LimitSkipped.Load(), err)
+	}
+}
+
+func TestZeroResultLimitsAreUnlimited(t *testing.T) {
+	for _, tc := range []struct {
+		name                    string
+		maxResults, maxPerQuery int
+	}{
+		{"both unlimited", 0, 0},
+		{"job unlimited", 0, 150},
+		{"per query unlimited", 150, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st, col, vs := adaptiveFixture(t)
+			var responses []provider.SearchResponse
+			for page := 0; page < 15; page++ {
+				var results []model.Result
+				for i := 0; i < 10; i++ {
+					results = append(results, model.Result{URL: fmt.Sprintf("https://example.test/%03d", page*10+i), Provider: "p", DiscoveredAt: time.Now()})
+				}
+				responses = append(responses, provider.SearchResponse{Results: results, Done: page == 14})
+			}
+			p := &sequenceProvider{name: "p", responses: responses}
+			s := New(st, col, slog.New(slog.NewTextHandler(io.Discard, nil)), Options{Workers: 1, MaxPages: 20, MaxResults: tc.maxResults, MaxResultsPerQuery: tc.maxPerQuery, PageSize: 100, SaturationEnabled: false, Retry: rl.RetryPolicy{MaxAttempts: 1}})
+			if err := s.Run(context.Background(), "job", vs, []Runtime{NewRuntime(p, 1000, 1)}, nil); err != nil {
+				t.Fatal(err)
+			}
+			if p.calls != 15 || col.Unique.Load() != 150 {
+				t.Fatalf("calls=%d unique=%d", p.calls, col.Unique.Load())
+			}
+		})
+	}
+}
+
 func TestDebugPageDiagnosticsExposePaginationAndYield(t *testing.T) {
 	st, col, vs := adaptiveFixture(t)
 	p := &sequenceProvider{name: "p", responses: []provider.SearchResponse{{Results: []model.Result{{URL: "https://example.test/a", Provider: "p", DiscoveredAt: time.Now()}}, Done: true}}}
@@ -237,7 +290,7 @@ func TestDebugPageDiagnosticsExposePaginationAndYield(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := logs.String()
-	for _, want := range []string{"logical_page=0", "upstream_page=1", "requested_page_size=100", `msg="provider page processed"`, "raw=1", "accepted=1", "new_unique=1", "outcome=USEFUL_PAGE", "provider_done=true", "coverage=trustworthy"} {
+	for _, want := range []string{"logical_page=0", "upstream_page=1", "requested_page_size=100", `msg="provider page processed"`, "provider_results=1", "processed=1", "accepted=1", "new_unique=1", "limit_skipped=0", "outcome=USEFUL_PAGE", "provider_done=true", "coverage=trustworthy"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("missing %q in logs:\n%s", want, text)
 		}

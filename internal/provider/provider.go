@@ -204,6 +204,8 @@ type Capable interface{ Capabilities() Capabilities }
 // behavior.
 type PaginationInfo struct {
 	UpstreamPage    int
+	UpstreamOffset  int
+	OffsetBased     bool
 	PageSizeApplied bool
 }
 

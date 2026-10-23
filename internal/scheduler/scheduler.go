@@ -233,7 +233,12 @@ func (s *Scheduler) runTask(ctx context.Context, job string, t task) error {
 		hasPagination := false
 		if describer, ok := t.rt.Provider.(provider.PaginationDescriber); ok {
 			pagination, hasPagination = describer.Pagination(req), true
-			requestAttrs = append(requestAttrs, "upstream_page", pagination.UpstreamPage, "page_size_applied", pagination.PageSizeApplied)
+			if pagination.OffsetBased {
+				requestAttrs = append(requestAttrs, "upstream_start", pagination.UpstreamOffset)
+			} else {
+				requestAttrs = append(requestAttrs, "upstream_page", pagination.UpstreamPage)
+			}
+			requestAttrs = append(requestAttrs, "page_size_applied", pagination.PageSizeApplied)
 		}
 		s.Log.Debug("provider request", requestAttrs...)
 		resp, err := t.rt.Provider.Search(ctx, req)
@@ -299,15 +304,20 @@ func (s *Scheduler) runTask(ctx context.Context, job string, t task) error {
 		}
 		responseAttrs := []any{"provider", p.Provider, "duration", resp.Duration, "http_status", resp.HTTPStatus, "logical_page", p.Page, "cursor", p.Cursor, "results", len(resp.Results), "retry_classification", "none"}
 		if hasPagination {
-			responseAttrs = append(responseAttrs, "upstream_page", pagination.UpstreamPage)
+			if pagination.OffsetBased {
+				responseAttrs = append(responseAttrs, "upstream_start", pagination.UpstreamOffset)
+			} else {
+				responseAttrs = append(responseAttrs, "upstream_page", pagination.UpstreamPage)
+			}
 		}
+		responseAttrs = append(responseAttrs, "next_cursor", resp.NextCursor, "provider_done", resp.Done)
 		s.Log.Debug("provider response", responseAttrs...)
 		for _, partial := range resp.PartialErrors {
 			s.reportMu.Lock()
 			s.report.Degraded = true
 			s.reportMu.Unlock()
 			_ = s.Store.Event(ctx, job, p.Provider, "partial_failure", partial.Error())
-			s.Log.Warn("provider instance failed; another continued", "provider", p.Provider, "error", partial)
+			s.Log.Warn("provider returned a partial response", "provider", p.Provider, "error", partial)
 		}
 		for _, diagnostic := range resp.Diagnostics {
 			s.reportMu.Lock()
@@ -333,11 +343,9 @@ func (s *Scheduler) runTask(ctx context.Context, job string, t task) error {
 		rawBefore, acceptedBefore := s.Collector.Raw.Load(), s.Collector.Accepted.Load()
 		rejectedBefore, unknownBefore := s.Collector.Rejected.Load(), s.Collector.UnknownKept.Load()
 		duplicatesBefore, malformedBefore := s.Collector.Duplicates.Load(), s.Collector.Malformed.Load()
-		batch := resp.Results
-		if remaining := s.remaining(t.v.Original); remaining >= 0 && len(batch) > remaining {
-			batch = batch[:remaining]
-		}
-		fresh, e := s.Collector.AddBatch(ctx, batch)
+		limitSkippedBefore := s.Collector.LimitSkipped.Load()
+		remainingBefore := s.remaining(t.v.Original)
+		fresh, _, e := s.Collector.AddBatchLimited(ctx, resp.Results, remainingBefore)
 		if e != nil {
 			s.collectMu.Unlock()
 			return fmt.Errorf("collect %s: %w", p.Provider, e)
@@ -354,6 +362,8 @@ func (s *Scheduler) runTask(ctx context.Context, job string, t task) error {
 		unknownDelta := int(s.Collector.UnknownKept.Load() - unknownBefore)
 		duplicateDelta := int(s.Collector.Duplicates.Load() - duplicatesBefore)
 		malformedDelta := int(s.Collector.Malformed.Load() - malformedBefore)
+		limitSkippedDelta := int(s.Collector.LimitSkipped.Load() - limitSkippedBefore)
+		remainingAfter := s.remaining(t.v.Original)
 		s.collectMu.Unlock()
 		outcome := ClassifyPage(resp, fresh, acceptedDelta, nil)
 		s.record(outcome)
@@ -415,9 +425,13 @@ func (s *Scheduler) runTask(ctx context.Context, job string, t task) error {
 		degraded := s.Report().Degraded
 		pageAttrs := []any{"provider", p.Provider, "logical_page", req.Page}
 		if hasPagination {
-			pageAttrs = append(pageAttrs, "upstream_page", pagination.UpstreamPage)
+			if pagination.OffsetBased {
+				pageAttrs = append(pageAttrs, "upstream_start", pagination.UpstreamOffset)
+			} else {
+				pageAttrs = append(pageAttrs, "upstream_page", pagination.UpstreamPage)
+			}
 		}
-		pageAttrs = append(pageAttrs, "raw", rawDelta, "normalized", rawDelta-malformedDelta, "accepted", acceptedDelta, "rejected", rejectedDelta, "malformed", malformedDelta, "duplicates", duplicateDelta, "new_unique", fresh, "outcome", outcome, "zero_yield_streak", p.ZeroYieldStreak, "provider_done", resp.Done, "coverage", map[bool]string{true: "degraded", false: "trustworthy"}[degraded], "degraded", degraded, "state", p.State)
+		pageAttrs = append(pageAttrs, "provider_results", len(resp.Results), "processed", rawDelta, "normalized", rawDelta-malformedDelta, "accepted", acceptedDelta, "rejected", rejectedDelta, "malformed", malformedDelta, "duplicates", duplicateDelta, "new_unique", fresh, "limit_skipped", limitSkippedDelta, "limit_remaining_before", remainingBefore, "limit_remaining_after", remainingAfter, "outcome", outcome, "zero_yield_streak", p.ZeroYieldStreak, "provider_done", resp.Done, "coverage", map[bool]string{true: "degraded", false: "trustworthy"}[degraded], "degraded", degraded, "state", p.State)
 		s.Log.Debug("provider page processed", pageAttrs...)
 		if e := s.Store.SaveProgress(ctx, p); e != nil {
 			return e

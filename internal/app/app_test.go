@@ -735,7 +735,7 @@ func TestDiscoverDebugReportsSeedProcessingCounters(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("code=%d stderr=%s", code, stderr.String())
 	}
-	for _, want := range []string{`msg="discovery seed processing"`, "depth=0", "raw=3", "normalized=3", "accepted=3", "rejected=0", "hosts_extracted=3", "duplicate_hosts=2", "frontier_added=1"} {
+	for _, want := range []string{`msg="provider page processed"`, "provider_results=10", "processed=10", "new_unique=3", "limit_skipped=7", `msg="discovery seed processing"`, "depth=0", "raw=10", "normalized=10", "accepted=10", "rejected=0", "hosts_extracted=3", "duplicate_hosts=2", "frontier_added=1"} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("missing %q in %s", want, stderr.String())
 		}
