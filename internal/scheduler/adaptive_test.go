@@ -29,6 +29,22 @@ type sequenceProvider struct {
 	calls     int
 }
 
+type barrierProvider struct {
+	name    string
+	results []model.Result
+	ready   *sync.WaitGroup
+}
+
+func (p *barrierProvider) Name() string { return p.name }
+func (p *barrierProvider) Health() provider.HealthStatus {
+	return provider.HealthStatus{State: provider.Ready}
+}
+func (p *barrierProvider) Search(context.Context, provider.SearchRequest) (provider.SearchResponse, error) {
+	p.ready.Done()
+	p.ready.Wait()
+	return provider.SearchResponse{Results: p.results}, nil
+}
+
 func (p *sequenceProvider) Name() string { return p.name }
 func (p *sequenceProvider) Health() provider.HealthStatus {
 	return provider.HealthStatus{State: provider.Ready}
@@ -237,8 +253,10 @@ func TestConcurrentProvidersRespectExactUniqueCap(t *testing.T) {
 		}
 		return out
 	}
-	a := &sequenceProvider{name: "a", responses: []provider.SearchResponse{{Results: results("a")}}}
-	b := &sequenceProvider{name: "b", responses: []provider.SearchResponse{{Results: results("b")}}}
+	var ready sync.WaitGroup
+	ready.Add(2)
+	a := &barrierProvider{name: "a", results: results("a"), ready: &ready}
+	b := &barrierProvider{name: "b", results: results("b"), ready: &ready}
 	s := New(st, col, slog.New(slog.NewTextHandler(io.Discard, nil)), Options{Workers: 2, MaxPages: 10, MaxResults: 3, MaxResultsPerQuery: 3, PageSize: 10, Retry: rl.RetryPolicy{MaxAttempts: 1}})
 	if err := s.Run(context.Background(), "job", vs, []Runtime{NewRuntime(a, 1000, 1), NewRuntime(b, 1000, 1)}, nil); err != nil {
 		t.Fatal(err)
